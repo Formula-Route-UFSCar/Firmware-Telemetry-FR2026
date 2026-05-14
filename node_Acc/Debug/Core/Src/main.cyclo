@@ -1,0 +1,14 @@
+../Core/Src/main.c:125:13:LED_On	1
+../Core/Src/main.c:126:13:LED_Off	1
+../Core/Src/main.c:127:13:LED_Toggle	1
+../Core/Src/main.c:135:26:MPU_Init	10
+../Core/Src/main.c:191:26:MPU_ReadAll	2
+../Core/Src/main.c:221:26:CAN_WaitMailbox	3
+../Core/Src/main.c:232:26:CAN_SendIMU	5
+../Core/Src/main.c:298:13:ErrorBlink	3
+../Core/Src/main.c:320:5:main	8
+../Core/Src/main.c:438:6:SystemClock_Config	3
+../Core/Src/main.c:478:13:MX_CAN_Init	2
+../Core/Src/main.c:502:13:MX_I2C1_Init	2
+../Core/Src/main.c:523:13:MX_GPIO_Init	1
+../Core/Src/main.c:550:6:Error_Handler	1
