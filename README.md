@@ -75,7 +75,7 @@ Firmware-Telemetry-FR2026/
 
 **Periféricos:**
 - I²C Fast Mode 400 kHz: SCL = PB6, SDA = PB7
-- CAN 500 kbps: RX = PA11, TX = PA12
+- CAN 500 kbps: RX = PB8, TX = PB9
 - LED diagnóstico: PC13 (ativo em nível baixo)
 
 **Fluxo de operação:**
