@@ -17,7 +17,7 @@
  * Frames CAN recebidos:
  *   0x201 | DLC 8 | Acel XYZ + Gyro X  (nó IMU)
  *   0x204 | DLC 4 | Gyro YZ             (nó IMU)
- *   0x202 | DLC 8 | Hall Acel + Freio   (nó Analog)
+ *   0x202 | DLC 8 | Hall Acel + Freio + Pressão Freio Diant/Tras (nó Analog)
  *
  * ============================================================================
  * PINOUT
@@ -101,6 +101,10 @@ typedef struct {
     /* Pedais */
     float hall_acel_pct;
     float hall_freio_pct;
+
+    /* Pressão de freio (raw ADC 0–4095; sem calibração bar definida) */
+    uint16_t press_freio_diant_raw;
+    uint16_t press_freio_tras_raw;
 } LogSample_t;
 
 typedef struct {
@@ -111,6 +115,8 @@ typedef struct {
 typedef struct {
     uint16_t hall_acel;
     uint16_t hall_freio;
+    uint16_t press_freio_diant;
+    uint16_t press_freio_tras;
 } Pedals_Raw_t;
 
 /* ============================================================================
@@ -199,15 +205,19 @@ static void processCANMessage(uint32_t id, const uint8_t *data, uint8_t len)
             break;
 
         case CAN_ID_PEDAIS:
-            if (len >= 4) {
-                g_pedals.hall_acel  = (uint16_t)((data[0] << 8) | data[1]);
-                g_pedals.hall_freio = (uint16_t)((data[2] << 8) | data[3]);
+            if (len >= 8) {
+                g_pedals.hall_acel         = (uint16_t)((data[0] << 8) | data[1]);
+                g_pedals.hall_freio        = (uint16_t)((data[2] << 8) | data[3]);
+                g_pedals.press_freio_diant = (uint16_t)((data[4] << 8) | data[5]);
+                g_pedals.press_freio_tras  = (uint16_t)((data[6] << 8) | data[7]);
                 g_frameCount_202++;
 
                 if(g_frameCount_202 % 50 == 0){
-                    Serial.printf("[0x202] Acel=%5.1f%% (raw=%4u) | Freio=%5.1f%% (raw=%4u)\n",
+                    Serial.printf("[0x202] Acel=%5.1f%% (raw=%4u) | Freio=%5.1f%% (raw=%4u) | "
+                                  "PFrDiant=%4u | PFrTras=%4u\n",
                         (g_pedals.hall_acel  * HALL_PCT_MAX) / HALL_ADC_MAX, g_pedals.hall_acel,
-                        (g_pedals.hall_freio * HALL_PCT_MAX) / HALL_ADC_MAX, g_pedals.hall_freio);
+                        (g_pedals.hall_freio * HALL_PCT_MAX) / HALL_ADC_MAX, g_pedals.hall_freio,
+                        g_pedals.press_freio_diant, g_pedals.press_freio_tras);
                 }
             }
             break;
@@ -237,6 +247,10 @@ static void buildSnapshot(LogSample_t *s)
     /* Pedais */
     s->hall_acel_pct  = (g_pedals.hall_acel  * HALL_PCT_MAX) / HALL_ADC_MAX;
     s->hall_freio_pct = (g_pedals.hall_freio * HALL_PCT_MAX) / HALL_ADC_MAX;
+
+    /* Pressão de freio (raw) */
+    s->press_freio_diant_raw = g_pedals.press_freio_diant;
+    s->press_freio_tras_raw  = g_pedals.press_freio_tras;
 
     xSemaphoreGive(g_dataMutex);
 }
@@ -300,7 +314,8 @@ static void createNewLogFile(void)
         "timestamp_ms,"
         "accel_x_g,accel_y_g,accel_z_g,"
         "gyro_x_dps,gyro_y_dps,gyro_z_dps,"
-        "hall_acel_pct,hall_freio_pct"
+        "hall_acel_pct,hall_freio_pct,"
+        "press_freio_diant_raw,press_freio_tras_raw"
     );
     g_dataFile.flush();
     g_lastFlushTime = millis();
@@ -314,16 +329,18 @@ static void writeSampleToSD(const LogSample_t *s)
 
     /* Monta a linha em buffer local — single write é mais rápido que
      * múltiplas chamadas a print(). */
-    char buf[200];
+    char buf[224];
     int n = snprintf(buf, sizeof(buf),
         "%lu,"
         "%.4f,%.4f,%.4f,"
         "%.2f,%.2f,%.2f,"
-        "%.1f,%.1f\n",
+        "%.1f,%.1f,"
+        "%u,%u\n",
         (unsigned long)s->timestamp_ms,
         s->ax_g, s->ay_g, s->az_g,
         s->gx_dps, s->gy_dps, s->gz_dps,
-        s->hall_acel_pct, s->hall_freio_pct
+        s->hall_acel_pct, s->hall_freio_pct,
+        s->press_freio_diant_raw, s->press_freio_tras_raw
     );
 
     if (n > 0) {

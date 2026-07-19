@@ -15,7 +15,7 @@
  * Frames CAN recebidos:
  *   0x201 | DLC 8 | Acel XYZ + Gyro X  (nó IMU)
  *   0x204 | DLC 4 | Gyro YZ             (nó IMU)
- *   0x202 | DLC 8 | Hall Acel + Freio   (nó Analog)
+ *   0x202 | DLC 8 | Hall Acel + Freio + Pressão Freio Diant/Tras (nó Analog)
  *   0x1E0 | DLC 8 | ECU ProTune PR440   (manual oficial 03/2024 R1)
  *
  * ============================================================================
@@ -133,6 +133,10 @@ typedef struct {
     float hall_acel_pct;
     float hall_freio_pct;
 
+    /* Pressão de freio (raw ADC 0–4095; sem calibração bar definida) */
+    uint16_t press_freio_diant_raw;
+    uint16_t press_freio_tras_raw;
+
     /* ECU ProTune */
     uint16_t rpm;
     float    ign_angle_deg;
@@ -173,6 +177,8 @@ typedef struct {
 typedef struct {
     uint16_t hall_acel;
     uint16_t hall_freio;
+    uint16_t press_freio_diant;
+    uint16_t press_freio_tras;
 } Pedals_Raw_t;
 
 /* ============================================================================
@@ -369,9 +375,11 @@ static void processCANMessage(uint32_t id, const uint8_t *data, uint8_t len)
             break;
 
         case CAN_ID_PEDAIS:
-            if (len >= 4) {
-                g_pedals.hall_acel  = (uint16_t)((data[0] << 8) | data[1]);
-                g_pedals.hall_freio = (uint16_t)((data[2] << 8) | data[3]);
+            if (len >= 8) {
+                g_pedals.hall_acel         = (uint16_t)((data[0] << 8) | data[1]);
+                g_pedals.hall_freio        = (uint16_t)((data[2] << 8) | data[3]);
+                g_pedals.press_freio_diant = (uint16_t)((data[4] << 8) | data[5]);
+                g_pedals.press_freio_tras  = (uint16_t)((data[6] << 8) | data[7]);
             }
             break;
 
@@ -400,6 +408,9 @@ static void buildSnapshot(LogSample_t *s)
 
     s->hall_acel_pct  = (g_pedals.hall_acel  * HALL_PCT_MAX) / HALL_ADC_MAX;
     s->hall_freio_pct = (g_pedals.hall_freio * HALL_PCT_MAX) / HALL_ADC_MAX;
+
+    s->press_freio_diant_raw = g_pedals.press_freio_diant;
+    s->press_freio_tras_raw  = g_pedals.press_freio_tras;
 
     s->rpm               = g_ecu.engine_rpm;
     s->ign_angle_deg     = g_ecu.ign_angle       * PT_IGN_SCALE;
@@ -619,6 +630,7 @@ static void createNewLogFile(void)
         "accel_x_g,accel_y_g,accel_z_g,"
         "gyro_x_dps,gyro_y_dps,gyro_z_dps,"
         "hall_acel_pct,hall_freio_pct,"
+        "press_freio_diant_raw,press_freio_tras_raw,"
         "rpm,ign_angle_deg,gear,"
         "map_kpa,iat_c,engine_temp_c,throttle_pct,"
         "battery_v,lambda1,"
@@ -635,12 +647,13 @@ static void writeSampleToSD(const LogSample_t *s)
 {
     if (!g_dataFile) return;
 
-    char buf[320];
+    char buf[352];
     int n = snprintf(buf, sizeof(buf),
         "%lu,"
         "%.4f,%.4f,%.4f,"
         "%.2f,%.2f,%.2f,"
         "%.1f,%.1f,"
+        "%u,%u,"
         "%u,%.1f,%d,"
         "%.1f,%.1f,%.1f,%.1f,"
         "%.1f,%.3f,"
@@ -650,6 +663,7 @@ static void writeSampleToSD(const LogSample_t *s)
         s->ax_g, s->ay_g, s->az_g,
         s->gx_dps, s->gy_dps, s->gz_dps,
         s->hall_acel_pct, s->hall_freio_pct,
+        s->press_freio_diant_raw, s->press_freio_tras_raw,
         s->rpm, s->ign_angle_deg, s->gear,
         s->map_kpa, s->iat_c, s->engine_temp_c, s->throttle_pct,
         s->battery_v, s->lambda1,

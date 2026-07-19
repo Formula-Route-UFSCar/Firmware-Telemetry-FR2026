@@ -2,31 +2,34 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Nó Analógico — Hall Acelerador + Hall Freio
+  * @brief          : Nó Analógico — Hall Acel/Freio + Pressão Freio Diant/Tras
   *
   * Sistema de Telemetria UFS-01B | Fórmula Route UFSCar
   *
   * Frame CAN transmitido (conforme Documento de Decisões Técnicas v2.0):
   *
-  *   ID 0x202 | DLC 8 | hall_acel_H,  hall_acel_L,
-  *                       hall_freio_H, hall_freio_L,
-  *                       0x00, 0x00, 0x00, 0x00       (reservados)
+  *   ID 0x202 | DLC 8 | hall_acel_H,   hall_acel_L,
+  *                       hall_freio_H,  hall_freio_L,
+  *                       pfreio_diant_H, pfreio_diant_L,
+  *                       pfreio_tras_H,  pfreio_tras_L
   *
   * Bit rate CAN : 500 kbps  (PCLK1 = 36 MHz, Prescaler=4, BS1=15TQ, BS2=2TQ)
   * Pinos CAN    : PA11 = CAN_RX  |  PA12 = CAN_TX
   *
   * Sensores:
-  *   PA0 → Hall Acelerador (0–5V analógico, ADC CH0)
-  *   PA1 → Hall Freio      (0–5V analógico, ADC CH1)
+  *   PA0 → Hall Acelerador          (0–5V analógico, ADC CH0)
+  *   PA1 → Hall Freio               (0–5V analógico, ADC CH1)
+  *   PA2 → Pressão Freio Dianteiro  (0–5V analógico, ADC CH2)
+  *   PA3 → Pressão Freio Traseiro   (0–5V analógico, ADC CH3)
   *
   * ADC:
   *   Resolução  : 12 bits (0–4095)
-  *   Scan Mode  : ENABLE (leitura sequencial de 2 canais)
+  *   Scan Mode  : ENABLE (leitura sequencial de 4 canais)
   *   Clock ADC  : APB2/6 = 72 MHz / 6 = 12 MHz
   *   Sampling   : 55.5 ciclos → ~4.6 µs por canal
   *
   * Conversão no receptor:
-  *   hall_pct = (adc_raw * 99.0) / 4095.0   → 0–99%
+  *   valor_pct = (adc_raw * 99.0) / 4095.0   → 0–99%
   *
   * Taxa de envio : 50 Hz (20 ms) conforme documento
   ******************************************************************************
@@ -50,10 +53,12 @@ typedef enum {
     ERR_HAL      = 5    /* Erro genérico da HAL                              */
 } SystemError_t;
 
-/** @brief Leitura raw dos sensores Hall (12 bits, 0–4095) */
+/** @brief Leitura raw dos sensores analógicos (12 bits, 0–4095) */
 typedef struct {
-    uint16_t hallAcel;
-    uint16_t hallFreio;
+    uint16_t hallAcel;      /* PA0 → Hall Acelerador                */
+    uint16_t hallFreio;     /* PA1 → Hall Freio                     */
+    uint16_t pFreioDiant;   /* PA2 → Pressão Freio Dianteiro        */
+    uint16_t pFreioTras;    /* PA3 → Pressão Freio Traseiro         */
 } LeituraAnalog_t;
 
 /* USER CODE END PTD */
@@ -70,7 +75,7 @@ typedef struct {
 #define ADC_POLL_TIMEOUT_MS   10      /* Timeout para conversão ADC           */
 
 /* ---------- ADC ---------- */
-#define ADC_NUM_CHANNELS      2       /* CH0 = Acelerador, CH1 = Freio        */
+#define ADC_NUM_CHANNELS      4       /* CH0=Acel, CH1=Freio, CH2=PFrDiant, CH3=PFrTras */
 
 /* ---------- Filtro média móvel (anti-ruído) ---------- */
 #define ADC_FILTER_SAMPLES    4       /* Média de 4 leituras por ciclo        */
@@ -120,10 +125,12 @@ static void              ErrorBlink(SystemError_t code);
  * ========================================================================== */
 
 /**
- * @brief  Lê os 2 canais ADC sequencialmente usando scan mode.
+ * @brief  Lê os 4 canais ADC sequencialmente.
  *
- *         Rank 1 → CH0 → PA0 → Hall Acelerador
- *         Rank 2 → CH1 → PA1 → Hall Freio
+ *         CH0 → PA0 → Hall Acelerador
+ *         CH1 → PA1 → Hall Freio
+ *         CH2 → PA2 → Pressão Freio Dianteiro
+ *         CH3 → PA3 → Pressão Freio Traseiro
  *
  * @param  out  Ponteiro para estrutura de saída com valores raw (0–4095)
  * @retval HAL_OK em sucesso, HAL_ERROR/HAL_TIMEOUT em falha
@@ -184,6 +191,54 @@ static HAL_StatusTypeDef ADC_ReadAll(LeituraAnalog_t *out)
     out->hallFreio = (uint16_t)HAL_ADC_GetValue(&hadc1);
     HAL_ADC_Stop(&hadc1);
 
+    /* ===== Canal 2: Pressão Freio Dianteiro (PA2) ===== */
+    sConfig.Channel = ADC_CHANNEL_2;
+    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+        g_adcErrors++;
+        out->pFreioDiant = 0;
+        return HAL_ERROR;
+    }
+
+    if (HAL_ADC_Start(&hadc1) != HAL_OK) {
+        g_adcErrors++;
+        out->pFreioDiant = 0;
+        return HAL_ERROR;
+    }
+
+    status = HAL_ADC_PollForConversion(&hadc1, ADC_POLL_TIMEOUT_MS);
+    if (status != HAL_OK) {
+        g_adcErrors++;
+        HAL_ADC_Stop(&hadc1);
+        out->pFreioDiant = 0;
+        return status;
+    }
+    out->pFreioDiant = (uint16_t)HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+
+    /* ===== Canal 3: Pressão Freio Traseiro (PA3) ===== */
+    sConfig.Channel = ADC_CHANNEL_3;
+    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+        g_adcErrors++;
+        out->pFreioTras = 0;
+        return HAL_ERROR;
+    }
+
+    if (HAL_ADC_Start(&hadc1) != HAL_OK) {
+        g_adcErrors++;
+        out->pFreioTras = 0;
+        return HAL_ERROR;
+    }
+
+    status = HAL_ADC_PollForConversion(&hadc1, ADC_POLL_TIMEOUT_MS);
+    if (status != HAL_OK) {
+        g_adcErrors++;
+        HAL_ADC_Stop(&hadc1);
+        out->pFreioTras = 0;
+        return status;
+    }
+    out->pFreioTras = (uint16_t)HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+
     return HAL_OK;
 }
 
@@ -196,8 +251,10 @@ static HAL_StatusTypeDef ADC_ReadAll(LeituraAnalog_t *out)
  */
 static HAL_StatusTypeDef ADC_ReadFiltered(LeituraAnalog_t *out)
 {
-    uint32_t sumAcel  = 0;
-    uint32_t sumFreio = 0;
+    uint32_t sumAcel        = 0;
+    uint32_t sumFreio       = 0;
+    uint32_t sumPFreioDiant = 0;
+    uint32_t sumPFreioTras  = 0;
     uint8_t  validSamples = 0;
     HAL_StatusTypeDef lastStatus = HAL_OK;
 
@@ -206,8 +263,10 @@ static HAL_StatusTypeDef ADC_ReadFiltered(LeituraAnalog_t *out)
         HAL_StatusTypeDef status = ADC_ReadAll(&raw);
 
         if (status == HAL_OK) {
-            sumAcel  += raw.hallAcel;
-            sumFreio += raw.hallFreio;
+            sumAcel        += raw.hallAcel;
+            sumFreio       += raw.hallFreio;
+            sumPFreioDiant += raw.pFreioDiant;
+            sumPFreioTras  += raw.pFreioTras;
             validSamples++;
         } else {
             lastStatus = status;
@@ -215,8 +274,10 @@ static HAL_StatusTypeDef ADC_ReadFiltered(LeituraAnalog_t *out)
     }
 
     if (validSamples > 0) {
-        out->hallAcel  = (uint16_t)(sumAcel  / validSamples);
-        out->hallFreio = (uint16_t)(sumFreio / validSamples);
+        out->hallAcel     = (uint16_t)(sumAcel        / validSamples);
+        out->hallFreio    = (uint16_t)(sumFreio       / validSamples);
+        out->pFreioDiant  = (uint16_t)(sumPFreioDiant / validSamples);
+        out->pFreioTras   = (uint16_t)(sumPFreioTras  / validSamples);
         return HAL_OK;
     }
 
@@ -229,9 +290,10 @@ static HAL_StatusTypeDef ADC_ReadFiltered(LeituraAnalog_t *out)
  * CAN — Transmissão conforme Documento de Decisões Técnicas v2.0
  *
  *  Frame 0x202 (DLC 8):
- *    Bytes 0-1: Hall Acelerador (big-endian, 0–4095)
- *    Bytes 2-3: Hall Freio      (big-endian, 0–4095)
- *    Bytes 4-7: Reservados (0x00)
+ *    Bytes 0-1: Hall Acelerador          (big-endian, 0–4095)
+ *    Bytes 2-3: Hall Freio               (big-endian, 0–4095)
+ *    Bytes 4-5: Pressão Freio Dianteiro  (big-endian, 0–4095)
+ *    Bytes 6-7: Pressão Freio Traseiro   (big-endian, 0–4095)
  * ========================================================================== */
 
 /**
@@ -276,11 +338,13 @@ static HAL_StatusTypeDef CAN_SendPedais(const LeituraAnalog_t *analog)
     txData[2] = (uint8_t)((analog->hallFreio >> 8) & 0xFF);
     txData[3] = (uint8_t)( analog->hallFreio       & 0xFF);
 
-    /* Bytes 4-7: Reservados */
-    txData[4] = 0x00;
-    txData[5] = 0x00;
-    txData[6] = 0x00;
-    txData[7] = 0x00;
+    /* Bytes 4-5: Pressão Freio Dianteiro (big-endian) */
+    txData[4] = (uint8_t)((analog->pFreioDiant >> 8) & 0xFF);
+    txData[5] = (uint8_t)( analog->pFreioDiant       & 0xFF);
+
+    /* Bytes 6-7: Pressão Freio Traseiro (big-endian) */
+    txData[6] = (uint8_t)((analog->pFreioTras >> 8) & 0xFF);
+    txData[7] = (uint8_t)( analog->pFreioTras       & 0xFF);
 
     if (CAN_WaitMailbox(CAN_TX_TIMEOUT_MS) != HAL_OK) {
         g_canTxErrors++;
@@ -483,9 +547,11 @@ void SystemClock_Config(void)
 /**
   * @brief ADC1 Initialization
   *
-  * Scan Mode habilitado com 2 canais sequenciais:
+  * 4 canais sequenciais (reconfigurados a cada leitura em ADC_ReadAll):
   *   Rank 1: CH0 (PA0) → Hall Acelerador
   *   Rank 2: CH1 (PA1) → Hall Freio
+  *   Rank 3: CH2 (PA2) → Pressão Freio Dianteiro
+  *   Rank 4: CH3 (PA3) → Pressão Freio Traseiro
   *
   * Sampling: 55.5 ciclos @ 12 MHz = ~4.6 µs por canal
   *
@@ -520,6 +586,22 @@ static void MX_ADC1_Init(void)
   /* Rank 2: PA1 → Hall Freio (CH1) */
   sConfig.Channel = ADC_CHANNEL_1;
   sConfig.Rank    = ADC_REGULAR_RANK_2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+      Error_Handler();
+  }
+
+  /* Rank 3: PA2 → Pressão Freio Dianteiro (CH2) */
+  sConfig.Channel = ADC_CHANNEL_2;
+  sConfig.Rank    = ADC_REGULAR_RANK_3;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+      Error_Handler();
+  }
+
+  /* Rank 4: PA3 → Pressão Freio Traseiro (CH3) */
+  sConfig.Channel = ADC_CHANNEL_3;
+  sConfig.Rank    = ADC_REGULAR_RANK_4;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
       Error_Handler();

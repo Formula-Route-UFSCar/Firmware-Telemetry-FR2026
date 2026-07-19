@@ -16,7 +16,8 @@ Sistema de telemetria embarcada para carro de Fórmula SAE. Rede CAN com dois n�
 │  │              │   │              │   │                │  │
 │  │  MPU-6050    │   │  Hall Acel   │   │  RPM, Temp     │  │
 │  │  Acelerôm.   │   │  Hall Freio  │   │  Pressão, etc. │  │
-│  │  Giroscópio  │   │  (ADC 12bit) │   │                │  │
+│  │  Giroscópio  │   │  Press Freio │   │                │  │
+│  │              │   │  (ADC 12bit) │   │                │  │
 │  │              │   │              │   │                │  │
 │  │  0x201/0x204 │   │    0x202     │   │     0x1E0      │  │
 │  └──────────────┘   └──────────────┘   └────────────────┘  │
@@ -57,7 +58,7 @@ Firmware-Telemetry-FR2026/
 |--------|-----|-------------|------------------------------------------------------------------------|
 | `0x201` | 8  | node_Acc    | `[AcelX_H, AcelX_L, AcelY_H, AcelY_L, AcelZ_H, AcelZ_L, GiroX_H, GiroX_L]` |
 | `0x204` | 4  | node_Acc    | `[GiroY_H, GiroY_L, GiroZ_H, GiroZ_L]`                               |
-| `0x202` | 8  | node_Analog | `[HallAcel_H, HallAcel_L, HallFreio_H, HallFreio_L, 0x00 × 4]`       |
+| `0x202` | 8  | node_Analog | `[HallAcel_H, HallAcel_L, HallFreio_H, HallFreio_L, PFreioDiant_H, PFreioDiant_L, PFreioTras_H, PFreioTras_L]` |
 | `0x1E0` | 8  | ECU PR440   | Parâmetros ECU (ver Manual R1 03/2024 — mapeamento interno)            |
 
 **Configuração CAN (STM32):** PCLK1 = 36 MHz, Prescaler = 4, BS1 = 15 TQ, BS2 = 2 TQ → 500 kbps.
@@ -66,6 +67,7 @@ Firmware-Telemetry-FR2026/
 - Aceleração: valor raw é inteiro com sinal de 16 bits, dividido por 16384 → unidade em *g* (fundo de escala ±2 g).
 - Velocidade angular: valor raw de 16 bits com sinal, dividido por 131 → unidade em °/s (fundo de escala ±250 °/s).
 - Pedais Hall: `porcentagem = (raw × 99.0) / 4095.0` → 0 a 99%.
+- Pressão de freio (dianteiro/traseiro): valor raw de 12 bits (0–4095) gravado direto no CSV; sem calibração em bar definida (aplicar curva do sensor no pós-processamento).
 
 ---
 
@@ -103,10 +105,14 @@ Firmware-Telemetry-FR2026/
 
 ## node_Analog — Nó de Pedais
 
-**Hardware:** STM32F103RB + dois sensores Hall de posição (0–5 V, nível lógico tolerado pelo ADC do STM32).
+**Hardware:** STM32F103RB + dois sensores Hall de posição (acelerador/freio) + dois sensores de pressão de freio (dianteiro/traseiro). Todos 0–5 V, nível lógico tolerado pelo ADC do STM32.
 
 **Periféricos:**
-- ADC 12 bits, modo scan dual-channel: CH0 = PA0 (acelerador), CH1 = PA1 (freio)
+- ADC 12 bits, leitura sequencial de 4 canais (sem DMA):
+  - CH0 = PA0 (Hall acelerador)
+  - CH1 = PA1 (Hall freio)
+  - CH2 = PA2 (Pressão freio dianteiro)
+  - CH3 = PA3 (Pressão freio traseiro)
 - Clock ADC: APB2/6 = 12 MHz; amostragem: 55,5 ciclos ≈ 4,6 µs por canal
 - Filtro anti-ruído: média móvel de 4 amostras por ciclo
 - CAN 500 kbps: RX = PA11, TX = PA12
@@ -115,10 +121,10 @@ Firmware-Telemetry-FR2026/
 **Fluxo de operação:**
 1. Inicializa HAL, ADC e CAN.
 2. Loop a 50 Hz:
-   - Dispara conversão ADC sequencial (CH0 → CH1).
+   - Dispara conversão ADC sequencial (CH0 → CH1 → CH2 → CH3), por polling.
    - Calcula média de 4 leituras para cada canal.
-   - Converte para porcentagem: `pct = (raw × 99.0) / 4095.0`.
-   - Monta frame `0x202` (DLC 8): bytes 0-1 Hall Acel, bytes 2-3 Hall Freio, bytes 4-7 reservados (0x00).
+   - Hall: converte para porcentagem `pct = (raw × 99.0) / 4095.0`. Pressão: envia raw (0–4095).
+   - Monta frame `0x202` (DLC 8): bytes 0-1 Hall Acel, 2-3 Hall Freio, 4-5 Pressão Freio Dianteiro, 6-7 Pressão Freio Traseiro.
    - Transmite pelo CAN.
 
 **Diagnóstico por flashes no LED PC13:**
@@ -246,4 +252,4 @@ Versão simplificada para validação dos nós Acc e Analog **sem ECU, sem displ
 - O MCP2515 no logger ESP32 opera a **3,3 V** (usar módulo com regulador ou divisor de nível caso o módulo seja de 5 V).
 - Garantir terminação de **120 Ω** em ambas as extremidades do barramento CAN.
 - O SD card deve ser formatado em **FAT32**.
-- Os sensores Hall dos pedais fornecem 0–5 V; verificar divisor resistivo ou proteção de nível antes de conectar ao STM32 (ADC tolerante a 3,3 V máximo em PA0/PA1).
+- Os sensores Hall dos pedais e de pressão de freio fornecem 0–5 V; verificar divisor resistivo ou proteção de nível antes de conectar ao STM32 (ADC tolerante a 3,3 V máximo em PA0–PA3).
