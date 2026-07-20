@@ -35,17 +35,17 @@ Idx Name          Size      VMA       LMA       File off  Algn
                   CONTENTS, READONLY, DEBUGGING, OCTETS
  15 .debug_rnglists 000006ac  00000000  00000000  000105c0  2**0
                   CONTENTS, READONLY, DEBUGGING, OCTETS
- 16 .debug_macro  00016ef5  00000000  00000000  00010c6c  2**0
+ 16 .debug_macro  00016ee2  00000000  00000000  00010c6c  2**0
                   CONTENTS, READONLY, DEBUGGING, OCTETS
- 17 .debug_line   0000ab28  00000000  00000000  00027b61  2**0
+ 17 .debug_line   0000ab55  00000000  00000000  00027b4e  2**0
                   CONTENTS, READONLY, DEBUGGING, OCTETS
- 18 .debug_str    0008456d  00000000  00000000  00032689  2**0
+ 18 .debug_str    0008450e  00000000  00000000  000326a3  2**0
                   CONTENTS, READONLY, DEBUGGING, OCTETS
- 19 .comment      00000043  00000000  00000000  000b6bf6  2**0
+ 19 .comment      00000043  00000000  00000000  000b6bb1  2**0
                   CONTENTS, READONLY
- 20 .debug_frame  00002374  00000000  00000000  000b6c3c  2**2
+ 20 .debug_frame  0000216c  00000000  00000000  000b6bf4  2**2
                   CONTENTS, READONLY, DEBUGGING, OCTETS
- 21 .debug_line_str 00000064  00000000  00000000  000b8fb0  2**0
+ 21 .debug_line_str 0000007b  00000000  00000000  000b8d60  2**0
                   CONTENTS, READONLY, DEBUGGING, OCTETS
 
 Disassembly of section .text:
@@ -13341,17 +13341,17 @@ static void RCC_Delay(uint32_t mdelay)
  8004c18:	b570      	push	{r4, r5, r6, lr}
  8004c1a:	2600      	movs	r6, #0
  8004c1c:	4d0c      	ldr	r5, [pc, #48]	@ (8004c50 <__libc_init_array+0x38>)
- 8004c1e:	4c0d      	ldr	r4, [pc, #52]	@ (8004c54 <__libc_init_array+0x3c>)
- 8004c20:	1b64      	subs	r4, r4, r5
- 8004c22:	10a4      	asrs	r4, r4, #2
+ 8004c1e:	4b0d      	ldr	r3, [pc, #52]	@ (8004c54 <__libc_init_array+0x3c>)
+ 8004c20:	1b5b      	subs	r3, r3, r5
+ 8004c22:	109c      	asrs	r4, r3, #2
  8004c24:	42a6      	cmp	r6, r4
  8004c26:	d109      	bne.n	8004c3c <__libc_init_array+0x24>
- 8004c28:	f000 f81a 	bl	8004c60 <_init>
- 8004c2c:	2600      	movs	r6, #0
+ 8004c28:	2600      	movs	r6, #0
+ 8004c2a:	f000 f819 	bl	8004c60 <_init>
  8004c2e:	4d0a      	ldr	r5, [pc, #40]	@ (8004c58 <__libc_init_array+0x40>)
- 8004c30:	4c0a      	ldr	r4, [pc, #40]	@ (8004c5c <__libc_init_array+0x44>)
- 8004c32:	1b64      	subs	r4, r4, r5
- 8004c34:	10a4      	asrs	r4, r4, #2
+ 8004c30:	4b0a      	ldr	r3, [pc, #40]	@ (8004c5c <__libc_init_array+0x44>)
+ 8004c32:	1b5b      	subs	r3, r3, r5
+ 8004c34:	109c      	asrs	r4, r3, #2
  8004c36:	42a6      	cmp	r6, r4
  8004c38:	d105      	bne.n	8004c46 <__libc_init_array+0x2e>
  8004c3a:	bd70      	pop	{r4, r5, r6, pc}

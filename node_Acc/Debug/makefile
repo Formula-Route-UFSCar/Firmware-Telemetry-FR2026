@@ -1,6 +1,6 @@
 ################################################################################
 # Automatically-generated file. Do not edit!
-# Toolchain: GNU Tools for STM32 (13.3.rel1)
+# Toolchain: GNU Tools for STM32 (14.3.rel1)
 ################################################################################
 
 -include ../makefile.init
@@ -66,8 +66,8 @@ all: main-build
 main-build: teste_IMU.elf secondary-outputs
 
 # Tool invocations
-teste_IMU.elf teste_IMU.map: $(OBJS) $(USER_OBJS) C:\Users\user\STM32CubeIDE\workspace_1.19.0\teste_IMU\STM32F103C8TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "teste_IMU.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"C:\Users\user\STM32CubeIDE\workspace_1.19.0\teste_IMU\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="teste_IMU.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+teste_IMU.elf teste_IMU.map: $(OBJS) $(USER_OBJS) C:\Users\mathe\OneDrive\Documentos\GitHub\Firmware-Telemetry-FR2026\node_Acc\STM32F103C8TX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "teste_IMU.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"C:\Users\mathe\OneDrive\Documentos\GitHub\Firmware-Telemetry-FR2026\node_Acc\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="teste_IMU.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

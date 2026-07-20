@@ -93,6 +93,7 @@
 #define DISPLAY_DIO_PIN     26
 #define DISPLAY_CLK_PIN     25
 #define BTN_LAP_PIN         16
+#define BTN_PAGE_PIN        2
 
 /* LEDs de aviso */
 #define LED_VOLT_BAT        21
@@ -234,6 +235,11 @@ static volatile uint32_t g_lapStartTime = 0;
 
 static volatile uint32_t g_protuneCrcErrors = 0;
 static volatile uint32_t g_protuneCrcOk     = 0;
+
+static bool g_sdAvailable = false; //Bypass SD
+
+static uint8_t g_displayPage = 0; 
+#define MAX_DISPLAY_PAGES    4
 
 /* Instância MCP2515 (usa VSPI default do ESP32) */
 static MCP_CAN       CAN0(MCP2515_CS_PIN);
@@ -572,34 +578,63 @@ static void updateRPMBar(uint16_t rpm)
  *   - Se motor parado (RPM = 0): mostra marcha atual (ex: "G 1", "G n")
  * ============================================================================ */
 
-static void updateDisplay(uint16_t rpm, int8_t gear)
+static void updateDisplay(uint16_t rpm, int8_t gear, float temp_c, float bat_v, float lambda)
 {
-    if (rpm >= 1000) {
-        g_display.showNumberDec(rpm, false);
-    } else if (rpm > 0) {
-        g_display.showNumberDec(rpm, true);
-    } else {
-        /* Motor parado: mostra marcha.
-         *
-         * NOTA: TM1637Display.h já define SEG_A..SEG_G como macros para os
-         *       bits dos segmentos individuais. Aqui montamos os caracteres
-         *       compostos com nomes diferentes para evitar colisão. */
+    /* Segmentos customizados úteis para o TM1637 (a=0x01, b=0x02, ..., g=0x40) */
+    const uint8_t CHAR_G = 0x7D; // 'G' (Marcha)
+    const uint8_t CHAR_C = 0x39; // 'C' (Celsius)
+    const uint8_t CHAR_U = 0x3E; // 'U' (Volts)
+    const uint8_t CHAR_L = 0x38; // 'L' (Lambda)
+    const uint8_t CHAR_N = 0x54; // 'n' (Neutro)
+    const uint8_t CHAR_R = 0x50; // 'r' (Re)
 
-        /* Segmentos: a=0x01, b=0x02, c=0x04, d=0x08, e=0x10, f=0x20, g=0x40 */
-        const uint8_t CHAR_G = 0x01 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40;  /* "G" */
-        const uint8_t CHAR_N = 0x04 | 0x10 | 0x40;                        /* "n" */
-        const uint8_t CHAR_R = 0x40 | 0x10;                               /* "r" */
+    uint8_t segs[4] = {0, 0, 0, 0};
 
-        uint8_t segs[4] = {0, 0, CHAR_G, 0};
+    switch (g_displayPage) {
+        case 0: /* Página 0: Automática (RPM ou Marcha) */
+            if (rpm >= 1000) {
+                g_display.showNumberDec(rpm, false);
+            } else if (rpm > 0) {
+                g_display.showNumberDec(rpm, true);
+            } else {
+                segs[2] = CHAR_G;
+                if (gear >= 0 && gear <= 9)      segs[3] = g_display.encodeDigit(gear);
+                else if (gear < 0)               segs[3] = CHAR_R;
+                else                             segs[3] = CHAR_N;
+                g_display.setSegments(segs);
+            }
+            break;
 
-        if (gear >= 0 && gear <= 9) {
-            segs[3] = g_display.encodeDigit(gear);
-        } else if (gear < 0) {
-            segs[3] = CHAR_R;  /* Marcha reversa */
-        } else {
-            segs[3] = CHAR_N;  /* Neutro/inválido */
+        case 1: /* Página 1: Temperatura (C XX) */
+            segs[0] = CHAR_C;
+            segs[1] = 0; // Espaço
+            g_display.setSegments(segs, 2, 0); // Desenha os 2 primeiros
+            g_display.showNumberDec((int)temp_c, false, 2, 2); // Desenha os 2 últimos
+            break;
+
+        case 2: /* Página 2: Bateria (U XX.X) */
+        {
+            segs[0] = CHAR_U;
+            g_display.setSegments(segs, 1, 0);
+            
+            // Ex: 13.5V -> 135. Mostramos 3 dígitos.
+            int bat_display = (int)(bat_v * 10.0f);
+            // O true habilita zeros à esquerda se a bateria cair para < 10V.
+            // O 0x40 (ou 0x80 dependendo do seu módulo) liga os dois pontos do display.
+            g_display.showNumberDecEx(bat_display, 0x40, true, 3, 1);
+            break;
         }
-        g_display.setSegments(segs);
+
+        case 3: /* Página 3: Lambda (L .XXX) */
+        {
+            segs[0] = CHAR_L;
+            g_display.setSegments(segs, 1, 0);
+            
+            // Ex: Lambda 0.980 -> mostramos "980" nos 3 últimos dígitos.
+            int lam_display = (int)(lambda * 1000.0f);
+            g_display.showNumberDec(lam_display, true, 3, 1); 
+            break;
+        }
     }
 }
 
@@ -612,6 +647,8 @@ static uint32_t g_lastFlushTime = 0;
 
 static void createNewLogFile(void)
 {
+    if (!g_sdAvailable) return;
+
     char filename[32];
     int fileNum = 0;
     do {
@@ -645,7 +682,7 @@ static void createNewLogFile(void)
 
 static void writeSampleToSD(const LogSample_t *s)
 {
-    if (!g_dataFile) return;
+    if (!g_sdAvailable || !g_dataFile) return;
 
     char buf[352];
     int n = snprintf(buf, sizeof(buf),
@@ -746,15 +783,25 @@ static void task_can(void *arg)
         }
 
         /* Display a cada 100 ms */
+/* Display a cada 100 ms */
         if (now - lastDispUpdate >= DISPLAY_UPDATE_MS) {
             lastDispUpdate = now;
+            
             uint16_t rpm;
             int8_t   gear;
+            float    temp_c;
+            float    bat_v;
+            float    lambda_val;
+
             xSemaphoreTake(g_dataMutex, portMAX_DELAY);
-            rpm  = g_ecu.engine_rpm;
-            gear = (int8_t)g_ecu.gear_position;
+            rpm        = g_ecu.engine_rpm;
+            gear       = (int8_t)g_ecu.gear_position;
+            temp_c     = g_ecu.engine_temp * PT_TEMP_SCALE;
+            bat_v      = g_ecu.battery_voltage * PT_BAT_SCALE;
+            lambda_val = g_ecu.lambda1 * PT_LAMBDA_SCALE;
             xSemaphoreGive(g_dataMutex);
-            updateDisplay(rpm, gear);
+            
+            updateDisplay(rpm, gear, temp_c, bat_v, lambda_val);
         }
 
         /* Estatísticas a cada 5s */
@@ -765,6 +812,41 @@ static void task_can(void *arg)
                               g_protuneCrcOk, g_protuneCrcErrors);
             }
         }
+
+        static uint32_t lastDebugTime = 0;
+        if (now - lastDebugTime >= 1000) { // Atualiza a cada 1 segundo
+            lastDebugTime = now;
+
+            xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+            int16_t raw_ax = g_imu.accel_x;
+            int16_t raw_ay = g_imu.accel_y;
+            int16_t raw_az = g_imu.accel_z;
+
+            int16_t raw_gx = g_imu.gyro_x;
+            int16_t raw_gy = g_imu.gyro_y;
+            int16_t raw_gz = g_imu.gyro_z;
+
+            uint16_t p_freio_diant = g_pedals.press_freio_diant;
+            uint16_t p_freio_tras  = g_pedals.press_freio_tras;
+            uint16_t hall_freio    = g_pedals.hall_freio;
+            xSemaphoreGive(g_dataMutex);
+
+            /* Converte a aceleração bruta para Força G */
+            float ax_g = raw_ax * ACCEL_SCALE;
+            float ay_g = raw_ay * ACCEL_SCALE;
+            float az_g = raw_az * ACCEL_SCALE;
+
+            float gx = raw_gx * GYRO_SCALE;
+            float gy = raw_gy * GYRO_SCALE;
+            float gz = raw_gz * GYRO_SCALE;
+
+            /* Converte o sensor Hall de freio para porcentagem (opcional) */
+            float hall_freio_pct = (hall_freio * HALL_PCT_MAX) / HALL_ADC_MAX;
+
+            Serial.printf("[TELEMETRIA] ACC(g): X=%.2f Y=%.2f Z=%.2f | GYRO: X=%.2f Y=%.2f Z=%.2f | FREIO(raw): D=%u T=%u | HALL_FR: %.1f%%\n",
+                          ax_g, ay_g, az_g,gx, gy, gz, p_freio_diant, p_freio_tras, hall_freio_pct);
+        }
+        /* ------------------------------------------------------------- */
 
         /* Yield curto para não monopolizar o core */
         vTaskDelay(pdMS_TO_TICKS(1));
@@ -805,11 +887,17 @@ static void handleLapButton(void)
 
     if (current != lastState && (now - lastChange) >= DEBOUNCE_MS) {
         lastChange = now;
-
+Serial.println("Botao <<<");
         if (current == LOW) {
             if (!g_recording) {
                 g_lapStartTime = millis();
-                createNewLogFile();
+                
+                if (g_sdAvailable) {
+                    createNewLogFile();
+                } else {
+                    Serial.println("[REC] Gravacao simulada (Bypass do SD)");
+                }
+                
                 g_recording = true;
                 digitalWrite(LED_STATUS_REC, HIGH);
                 Serial.println("[REC] >>> GRAVACAO INICIADA <<<");
@@ -817,12 +905,36 @@ static void handleLapButton(void)
                 g_recording = false;
                 digitalWrite(LED_STATUS_REC, LOW);
                 vTaskDelay(pdMS_TO_TICKS(100));
-                if (g_dataFile) {
+                
+                if (g_sdAvailable && g_dataFile) { // Proteção extra no fechamento
                     g_dataFile.flush();
                     g_dataFile.close();
                 }
                 Serial.println("[REC] >>> GRAVACAO PARADA <<<");
             }
+        }
+        lastState = current;
+    }
+}
+
+static void handlePageButton(void)
+{
+    static bool     lastState   = HIGH;
+    static uint32_t lastChange  = 0;
+    const  uint32_t DEBOUNCE_MS = 50;
+
+    bool current = digitalRead(BTN_PAGE_PIN);
+    uint32_t now = millis();
+
+    if (current != lastState && (now - lastChange) >= DEBOUNCE_MS) {
+        lastChange = now;
+
+        if (current == LOW) { // Botão pressionado
+            g_displayPage++;
+            if (g_displayPage >= MAX_DISPLAY_PAGES) {
+                g_displayPage = 0; // Volta para a primeira página
+            }
+            Serial.printf("[DISPLAY] Pagina alterada para: %d\n", g_displayPage);
         }
         lastState = current;
     }
@@ -848,7 +960,8 @@ void setup()
     pinMode(LED_TEMP_AGUA,  OUTPUT);
     pinMode(LED_PRESS_OLEO, OUTPUT);
     pinMode(LED_STATUS_REC, OUTPUT);
-    pinMode(BTN_LAP_PIN,    INPUT_PULLUP);
+    pinMode(BTN_LAP_PIN,    INPUT_PULLDOWN);
+    pinMode(BTN_PAGE_PIN,   INPUT_PULLDOWN);
 
     digitalWrite(LED_VOLT_BAT,   LOW);
     digitalWrite(LED_TEMP_AGUA,  LOW);
@@ -865,17 +978,17 @@ void setup()
     g_display.setBrightness(5);
     g_display.clear();
 
-    /* Inicializa HSPI para o SD (não conflita com VSPI do MCP2515) */
+/* Inicializa HSPI para o SD (não conflita com VSPI do MCP2515) */
     spiSD.begin(HSPI_SCK, HSPI_MISO, HSPI_MOSI, SD_CS_PIN);
 
     if (!SD.begin(SD_CS_PIN, spiSD)) {
-        Serial.println("[SD] ERRO FATAL - cartao nao inicializou");
-        while (1) {
-            digitalWrite(LED_STATUS_REC, HIGH); delay(200);
-            digitalWrite(LED_STATUS_REC, LOW);  delay(200);
-        }
+        Serial.println("[SD] AVISO - Cartao nao inicializou. Modo Bypass ativado.");
+        g_sdAvailable = false;
+        /* O código não trava mais aqui. Ele segue a vida sem o SD. */
+    } else {
+        Serial.println("[SD] OK (HSPI)");
+        g_sdAvailable = true;
     }
-    Serial.println("[SD] OK (HSPI)");
 
     /* Inicializa MCP2515 no VSPI */
     if (!setup_mcp2515()) {
@@ -922,5 +1035,6 @@ void setup()
 void loop()
 {
     handleLapButton();
+    handlePageButton(); /* NOVO BOTAO AQUI */
     delay(10);
 }
