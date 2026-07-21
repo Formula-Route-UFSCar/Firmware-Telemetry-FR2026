@@ -278,36 +278,38 @@ static uint8_t CheckSumCAN(const uint8_t *ss)
     return checksum;
 }
 
+/* ============================================================================
+ * CORREÇÃO: Funções ajustadas para ler BIG-ENDIAN (MSB first)
+ * ============================================================================ */
 static inline int16_t pt_i16(const uint8_t *data, uint8_t offset)
 {
-    return (int16_t)(data[offset] | (data[offset + 1] << 8));
+    /* Desloca o primeiro byte (MSB) 8 vezes e soma com o segundo (LSB) */
+    return (int16_t)((data[offset] << 8) | data[offset + 1]);
 }
 
 static inline uint16_t pt_u16(const uint8_t *data, uint8_t offset)
 {
-    return (uint16_t)(data[offset] | (data[offset + 1] << 8));
+    return (uint16_t)((data[offset] << 8) | data[offset + 1]);
 }
 
-/**
- * @brief  Decodifica um pacote CAN da ECU ProTune PR440.
- *         Chamado sob mutex.
- */
+/* ============================================================================
+ * DECODIFICAÇÃO PROTUNE (Conforme Manual Oficial em C/C++)
+ * ============================================================================ */
 static void decodeProTunePacket(const uint8_t *data_in)
 {
-    /* Cópia local: mascaramos rx[1] para calcular o checksum sem
-     * modificar o buffer original. */
     uint8_t rx[8];
     memcpy(rx, data_in, 8);
 
     uint8_t packet  = rx[0];
-    uint8_t dataset = rx[1] >> 5;
+    uint8_t dataset = rx[1] >> 5;  // usa somente os 3 primeiros bits (dataset)
 
-    if (dataset > 4) return;
+    if (dataset > 4) return;       // qualquer valor acima ou igual a 4 é ignorado
 
-    uint8_t checksum = rx[1] & 0x1F;
-    rx[1] &= ~0x1F;  /* MÁSCARA: zera os 5 bits de checksum */
+    uint8_t checksum = rx[1] & 0x1F; // usa apenas os 5 últimos bits (checkSum)
 
-    uint8_t checkCalc = CheckSumCAN(rx) & 0x1F;
+    rx[1] &= ~0x1F; // Mascara o checksum do pacote atual
+
+    uint8_t checkCalc = CheckSumCAN(rx) & 0x1F; // Calcula checksum e testa se está oK
 
     if (checksum != checkCalc) {
         g_protuneCrcErrors++;
@@ -315,38 +317,39 @@ static void decodeProTunePacket(const uint8_t *data_in)
     }
     g_protuneCrcOk++;
 
+    /* O Switch vai direto no Packet, sem restrição de Dataset */
     switch (packet) {
-        case 2:   /* RPM (off 2, u16) + Ignition Angle (off 4, s16, 1 casa) */
+        case 2:
             g_ecu.engine_rpm = pt_u16(rx, 2);
             g_ecu.ign_angle  = pt_i16(rx, 4);
             break;
 
-        case 4:   /* Gear Position (off 4, s16, 0 casas) */
+        case 4:
             g_ecu.gear_position = pt_i16(rx, 4);
             break;
 
-        case 5:   /* MAP (off 2) + IAT (off 4) + ET (off 6), todos s16 1 casa */
+        case 5:
             g_ecu.map         = pt_i16(rx, 2);
             g_ecu.iat         = pt_i16(rx, 4);
             g_ecu.engine_temp = pt_i16(rx, 6);
             break;
 
-        case 6:   /* Throttle + Battery + Lambda1 */
+        case 6:
             g_ecu.throttle_pos    = pt_i16(rx, 2);
             g_ecu.battery_voltage = pt_i16(rx, 4);
             g_ecu.lambda1         = pt_i16(rx, 6);
             break;
 
-        case 8:   /* Vehicle Speed (off 4, s16, 1 casa) */
+        case 8:
             g_ecu.vehicle_speed = pt_i16(rx, 4);
             break;
 
-        case 15:  /* Oil Pressure (off 2) + Fuel Pressure (off 4), s16 2 casas */
+        case 15:
             g_ecu.oil_pressure  = pt_i16(rx, 2);
             g_ecu.fuel_pressure = pt_i16(rx, 4);
             break;
 
-        case 79:  /* Fuel Tank Level (off 6, u16, 2 casas) */
+        case 79:
             g_ecu.fuel_level = pt_u16(rx, 6);
             break;
 
@@ -597,10 +600,19 @@ static void updateDisplay(uint16_t rpm, int8_t gear, float temp_c, float bat_v, 
             } else if (rpm > 0) {
                 g_display.showNumberDec(rpm, true);
             } else {
-                segs[2] = CHAR_G;
-                if (gear >= 0 && gear <= 9)      segs[3] = g_display.encodeDigit(gear);
-                else if (gear < 0)               segs[3] = CHAR_R;
-                else                             segs[3] = CHAR_N;
+                /* Motor parado: exibe a marcha atual */
+                segs[2] = 0; // Garante que o dígito da dezena está apagado
+                
+                if (gear == 0) {
+                    segs[3] = CHAR_N; // Ponto morto: mostra apenas 'n'
+                } 
+                else if (gear > 0 && gear <= 9) {
+                    segs[3] = g_display.encodeDigit(gear); // Mostra o número da marcha (1 a 6)
+                } 
+                else if (gear < 0) {
+                    segs[3] = CHAR_R; // Ré: mostra 'r'
+                }
+                
                 g_display.setSegments(segs);
             }
             break;
@@ -813,38 +825,56 @@ static void task_can(void *arg)
             }
         }
 
-        static uint32_t lastDebugTime = 0;
+static uint32_t lastDebugTime = 0;
         if (now - lastDebugTime >= 1000) { // Atualiza a cada 1 segundo
             lastDebugTime = now;
 
+            /* 1. Captura rápida de todos os dados protegidos pelo Mutex */
             xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+            
+            // Dados Chassi
             int16_t raw_ax = g_imu.accel_x;
             int16_t raw_ay = g_imu.accel_y;
             int16_t raw_az = g_imu.accel_z;
-
             int16_t raw_gx = g_imu.gyro_x;
             int16_t raw_gy = g_imu.gyro_y;
             int16_t raw_gz = g_imu.gyro_z;
-
             uint16_t p_freio_diant = g_pedals.press_freio_diant;
             uint16_t p_freio_tras  = g_pedals.press_freio_tras;
             uint16_t hall_freio    = g_pedals.hall_freio;
+
+            // Dados Motor (ProTune)
+            uint16_t ecu_rpm    = g_ecu.engine_rpm;
+            int16_t  ecu_temp   = g_ecu.engine_temp;
+            int16_t  ecu_tps    = g_ecu.throttle_pos;
+            int16_t  ecu_bat    = g_ecu.battery_voltage;
+            int16_t  ecu_oil    = g_ecu.oil_pressure;
+            int16_t  ecu_lambda = g_ecu.lambda1;
+            
             xSemaphoreGive(g_dataMutex);
 
-            /* Converte a aceleração bruta para Força G */
+            /* 2. Conversões (Chassi) */
             float ax_g = raw_ax * ACCEL_SCALE;
             float ay_g = raw_ay * ACCEL_SCALE;
             float az_g = raw_az * ACCEL_SCALE;
-
             float gx = raw_gx * GYRO_SCALE;
             float gy = raw_gy * GYRO_SCALE;
             float gz = raw_gz * GYRO_SCALE;
-
-            /* Converte o sensor Hall de freio para porcentagem (opcional) */
             float hall_freio_pct = (hall_freio * HALL_PCT_MAX) / HALL_ADC_MAX;
 
-            Serial.printf("[TELEMETRIA] ACC(g): X=%.2f Y=%.2f Z=%.2f | GYRO: X=%.2f Y=%.2f Z=%.2f | FREIO(raw): D=%u T=%u | HALL_FR: %.1f%%\n",
-                          ax_g, ay_g, az_g,gx, gy, gz, p_freio_diant, p_freio_tras, hall_freio_pct);
+            /* 3. Conversões (Motor) */
+            float temp_c  = ecu_temp * PT_TEMP_SCALE;
+            float tps_pct = ecu_tps  * PT_TP_SCALE;
+            float bat_v   = ecu_bat  * PT_BAT_SCALE;
+            float oil_bar = ecu_oil  * PT_OIL_SCALE;
+            float lambda  = ecu_lambda * PT_LAMBDA_SCALE;
+
+            /* 4. Impressão formatada */
+            Serial.printf("[TELEMETRIA-CHASSI] ACC(g): X=%.2f Y=%.2f Z=%.2f | GYRO: X=%.2f Y=%.2f Z=%.2f | FREIO(raw): D=%u T=%u | HALL_FR: %.1f%%\n",
+                          ax_g, ay_g, az_g, gx, gy, gz, p_freio_diant, p_freio_tras, hall_freio_pct);
+                          
+            Serial.printf("[TELEMETRIA-MOTOR]  RPM: %u | TEMP: %.1fC | TPS: %.1f%% | BAT: %.1fV | OLEO: %.2fbar | LAMBDA: %.3f\n",
+                          ecu_rpm, temp_c, tps_pct, bat_v, oil_bar, lambda);
         }
         /* ------------------------------------------------------------- */
 
