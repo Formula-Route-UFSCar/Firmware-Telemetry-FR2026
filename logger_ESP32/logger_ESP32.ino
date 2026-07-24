@@ -75,6 +75,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
+#define TINY_GSM_MODEM_SIM7600
+
 #include <TinyGsmClient.h>
 #include <ArduinoHttpClient.h>
 
@@ -99,8 +101,9 @@
 #define RPM_LED_PIN 27
 #define DISPLAY_DIO_PIN 26
 #define DISPLAY_CLK_PIN 25
-#define BTN_LAP_PIN 16
-#define BTN_PAGE_PIN 2
+
+#define BTN_LAP_PIN 34
+#define BTN_PAGE_PIN 35
 
 /* LEDs de aviso */
 #define LED_VOLT_BAT 4
@@ -112,10 +115,10 @@
  * LIMITES DE ALERTA (THRESHOLDS)
  * ============================================================================ */
 #define LIMIT_BAT_MIN 11.5f   // Volts
-#define LIMIT_BAT_MAX 14.8f   // Volts (Alerta de sobrecarga)
-#define LIMIT_TEMP_MAX 95.0f  // Graus Celsius
-#define LIMIT_OIL_MIN 0.1f    // Bar
-#define LIMIT_FUEL_MIN 0.1f   // Bar
+#define LIMIT_BAT_MAX 15.8f   // Volts (Alerta de sobrecarga)
+#define LIMIT_TEMP_MAX 98.0f  // Graus Celsius
+#define LIMIT_OIL_MIN 0.5f    // Bar
+#define LIMIT_FUEL_MIN 2.1f   // Bar
 
 #define LED_STATUS_REC 34
 
@@ -156,21 +159,20 @@ const float GEAR_RATIOS[6] = { 2.846f, 1.947f, 1.556f, 1.333f, 1.190f, 1.083f };
 /* ============================================================================
  * COMUNICAÇÃO 4G LTE (SimCom A7670SA)
  * ============================================================================ */
-#define TINY_GSM_MODEM_SIM7600
-#define MODEM_TX_PIN 16  // Pino TX do ESP32
-#define MODEM_RX_PIN 17  // Pino RX do ESP32
+#define MODEM_TX_PIN 2  // Pino TX do ESP32
+#define MODEM_RX_PIN 16  // Pino RX do ESP32
 #define MODEM_PWR_PIN 4  // Pino K (Key)
 
 /* Credenciais da Operadora e Servidor */
-const char apn[] = "zap.vivo.com.br";
-const char gprsUser[] = "vivo";
-const char gprsPass[] = "vivo";
+const char apn[] = "timbrasil.br";
+const char gprsUser[] = "tim";
+const char gprsPass[] = "tim";
 
-const char serverAddress[] = "ec2-34-220-119-142.us-west-2.compute.amazonaws.com";
-const int serverPort = 8080;
+const char serverAddress[] = "formularoute-rtt-server.onrender.com";
+const int serverPort = 80;
 
 /* Instâncias de Comunicação */
-HardwareSerial SerialModem(1);
+HardwareSerial SerialModem(1); // Usa a UART1 do ESP32
 TinyGsm modem(SerialModem);
 TinyGsmClient client(modem);
 HttpClient http(client, serverAddress, serverPort);
@@ -196,7 +198,7 @@ typedef struct {
   float press_freio_diant_psi;
   float press_freio_tras_psi;
 
-  /* Pressão de freio (raw ADC 0–4095; sem calibração bar definida) */
+  /* Pressão de freio RAW */
   uint16_t press_freio_diant_raw;
   uint16_t press_freio_tras_raw;
 
@@ -426,42 +428,41 @@ static void onCarStopMoving() {
 /* --- BATERIA --- */
 static void onBatWarningEnter() {
   Serial.println("[ALERTA] Bateria fora do ideal! Ativando LED.");
-  digitalWrite(LED_VOLT_BAT, HIGH);
-  // Aqui você também poderia mandar um JSON via 4G avisando os boxes
+
 }
 static void onBatWarningExit() {
   Serial.println("[ALERTA] Bateria Normalizada. Desativando LED.");
-  digitalWrite(LED_VOLT_BAT, LOW);
+
 }
 
 /* --- TEMPERATURA DA ÁGUA --- */
 static void onTempWarningEnter() {
   Serial.println("[ALERTA] Superaquecimento da Água! Ativando LED.");
-  digitalWrite(LED_TEMP_AGUA, HIGH);
+
 }
 static void onTempWarningExit() {
   Serial.println("[ALERTA] Temperatura Normalizada. Desativando LED.");
-  digitalWrite(LED_TEMP_AGUA, LOW);
+
 }
 
 /* --- PRESSÃO DE ÓLEO --- */
 static void onOilWarningEnter() {
   Serial.println("[ALERTA CRÍTICO] Baixa Pressão de Óleo! Ativando LED.");
-  digitalWrite(LED_PRESS_OLEO, HIGH);
+
 }
 static void onOilWarningExit() {
   Serial.println("[ALERTA] Pressão de Óleo Normalizada. Desativando LED.");
-  digitalWrite(LED_PRESS_OLEO, LOW);
+
 }
 
 /* --- COMBUSTÍVEL --- */
 static void onFuelWarningEnter() {
   Serial.println("[ALERTA] Combustível na Reserva! Ativando LED.");
-  digitalWrite(LED_COMB, HIGH);
+
 }
 static void onFuelWarningExit() {
   Serial.println("[ALERTA] Combustível Normalizado (Reabastecido). Desativando LED.");
-  digitalWrite(LED_COMB, LOW);
+
 }
 
 /* ============================================================================
@@ -662,54 +663,6 @@ static bool setup_mcp2515(void) {
 
   Serial.println("[MCP2515] ERRO FATAL — verifique fiação SPI e cristal");
   return false;
-}
-
-/* ============================================================================
- * LEDS DE ALERTA
- * ============================================================================ */
-
-static void updateAlertLEDs(void) {
-  static uint32_t lastBlink[3] = { 0, 0, 0 };
-  const uint32_t now = millis();
-
-  float bat_v, temp_c, oil_bar;
-
-  xSemaphoreTake(g_dataMutex, portMAX_DELAY);
-  bat_v = g_ecu.battery_voltage * PT_BAT_SCALE;
-  temp_c = g_ecu.engine_temp * PT_TEMP_SCALE;
-  oil_bar = g_ecu.oil_pressure * PT_OIL_SCALE;
-  xSemaphoreGive(g_dataMutex);
-
-  if (bat_v > 14.0f) {
-    if (now - lastBlink[0] >= LED_BLINK_INTERVAL_MS) {
-      digitalWrite(LED_VOLT_BAT, !digitalRead(LED_VOLT_BAT));
-      lastBlink[0] = now;
-    }
-  } else if (bat_v < 10.0f) {
-    digitalWrite(LED_VOLT_BAT, HIGH);
-  } else {
-    digitalWrite(LED_VOLT_BAT, LOW);
-  }
-
-  if (temp_c > 95.0f) {
-    if (now - lastBlink[1] >= LED_BLINK_INTERVAL_MS) {
-      digitalWrite(LED_TEMP_AGUA, !digitalRead(LED_TEMP_AGUA));
-      lastBlink[1] = now;
-    }
-  } else {
-    digitalWrite(LED_TEMP_AGUA, LOW);
-  }
-
-  if (oil_bar < 2.0f) {
-    if (now - lastBlink[2] >= LED_BLINK_INTERVAL_MS) {
-      digitalWrite(LED_PRESS_OLEO, !digitalRead(LED_PRESS_OLEO));
-      lastBlink[2] = now;
-    }
-  } else if (oil_bar < 3.0f) {
-    digitalWrite(LED_PRESS_OLEO, HIGH);
-  } else {
-    digitalWrite(LED_PRESS_OLEO, LOW);
-  }
 }
 
 /* ============================================================================
@@ -1104,13 +1057,14 @@ static void powerOnModem() {
   pinMode(MODEM_PWR_PIN, OUTPUT);
   Serial.println("[4G] Ligando modem...");
 
-  // Sequência exata do Datasheet para acordar o A7670
   digitalWrite(MODEM_PWR_PIN, LOW);
   vTaskDelay(pdMS_TO_TICKS(100));
   digitalWrite(MODEM_PWR_PIN, HIGH);
   vTaskDelay(pdMS_TO_TICKS(1000));
   digitalWrite(MODEM_PWR_PIN, LOW);
-  vTaskDelay(pdMS_TO_TICKS(6000));  // Tempo para o OS do modem iniciar
+  
+  // Alterado para 11 segundos exatamente como no código que funcionou
+  vTaskDelay(pdMS_TO_TICKS(11000)); 
 }
 
 /* Conecta na Rede Móvel e APN */
@@ -1118,23 +1072,25 @@ static bool initGSM() {
   Serial.println("[4G] Iniciando comunicacao AT...");
   SerialModem.begin(115200, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
 
-  if (!modem.restart()) {
-    Serial.println("[4G] ERRO: Modem nao respondeu aos comandos AT.");
+  // Usa init() ao invés de restart() para evitar reboots lentos
+  if (!modem.init()) {
+    Serial.println("[4G] ERRO: Falha ao inicializar o modem (modem.init).");
     return false;
   }
 
-  Serial.print("[4G] Aguardando sinal de rede...");
-  if (!modem.waitForNetwork(60000L)) {
-    Serial.println(" FALHOU!");
+  Serial.print("[4G] Waiting for network...");
+  if (!modem.waitForNetwork(60000L)) { // Timeout seguro de 60s
+    Serial.println(" fail");
     return false;
   }
-  Serial.println(" OK!");
+  Serial.println(" success");
 
   Serial.print("[4G] Conectando na APN (PDP Context)...");
   if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
-    Serial.println(" FALHOU!");
+    Serial.println(" fail");
     return false;
   }
+  
   Serial.println(" CONECTADO COM SUCESSO!");
   return true;
 }
@@ -1147,20 +1103,63 @@ static void sendTelemetryPost(const char *jsonPayload) {
     return;
   }
 
-  Serial.println("[4G] Enviando pacote ao Servidor Spring...");
+  Serial.println("[4G] making POST request");
 
   http.beginRequest();
-  http.post("/main/parameter/register");  // Endpoint de destino
+  http.post("/main/parameter/register"); 
+  
+  // Headers essenciais
   http.sendHeader("Content-Type", "application/json");
-  http.sendHeader("Content-Length", strlen(jsonPayload));
+  http.sendHeader("User-Agent", "PostmanRuntime/7.32.3"); // Previne erro 403
+  http.sendHeader("Accept", "*/*");
+  http.sendHeader("Content-Length", String(jsonPayload).length());
+  
   http.beginBody();
   http.print(jsonPayload);
+  http.endRequest();
+  
+  int statusCode = http.responseStatusCode();
+  Serial.printf("[4G] Resposta HTTP: %d\n", statusCode);
+
+  http.stop(); 
+}
+
+/* ============================================================================
+ * TESTE DE CONEXÃO COM O SERVIDOR SPRING (GET)
+ * ============================================================================ */
+static bool testServerConnection() {
+  Serial.println("[4G] Executando GET de teste em /main/test...");
+
+  // Reduzido para 5 segundos. Assim o ESP32 não trava a CPU esperando o Render acordar.
+  http.setTimeout(15000); 
+
+  http.beginRequest();
+  http.get("/main/test");
+  
+  http.sendHeader("Host", "formularoute-rtt-server.onrender.com");
+  http.sendHeader("User-Agent", "PostmanRuntime/7.55.1");
+  http.sendHeader("Accept", "*/*");
+  http.sendHeader("Accept-Encoding", "gzip, deflate, br");
+  http.sendHeader("Connection", "keep-alive");
   http.endRequest();
 
   int statusCode = http.responseStatusCode();
   String response = http.responseBody();
+  
+  http.stop(); // Libera o modem imediatamente
 
-  Serial.printf("[4G] Resposta HTTP: %d\n", statusCode);
+  Serial.printf("[4G] Status HTTP: %d\n", statusCode);
+  Serial.print("[4G] Resposta: ");
+  Serial.println(response);
+
+  if (statusCode == 200 && response.indexOf("TESTING...") >= 0) {
+    Serial.println("[4G] >>> TESTE DO SERVIDOR BEM-SUCEDIDO! <<<");
+    return true;
+  } else {
+    // Retorna falso mas NÃO dá crash. A Task lá embaixo vai lidar com isso.
+    Serial.println("[4G] Servidor dormindo (ou erro). Acordando...");
+    return false;
+  }
 }
 
 /* ============================================================================
@@ -1257,12 +1256,13 @@ static void task_can(void *arg) {
       int8_t calc_gear = (fast_gear != 0) ? fast_gear : ecu_gear;
 
       /* Print */
-      Serial.printf("[TELEMETRIA-CHASSI] ACC(g): X=%.2f Y=%.2f Z=%.2f | GYRO: X=%.2f Y=%.2f Z=%.2f | FREIO(psi): D=%.1f T=%.1f | FREIO(raw): D=%u T=%u | HALL_FR: %.1f%%\n",
+     /* Serial.printf("[TELEMETRIA-CHASSI] ACC(g): X=%.2f Y=%.2f Z=%.2f | GYRO: X=%.2f Y=%.2f Z=%.2f | FREIO(psi): D=%.1f T=%.1f | FREIO(raw): D=%u T=%u | HALL_FR: %.1f%%\n",
                     ax_g, ay_g, az_g, gx, gy, gz, psi_diant, psi_tras, p_freio_diant, p_freio_tras, hall_freio_pct);
 
       // Adicionado "MARCHA: X (ECU: Y)" para você ver a marcha calculada e a marcha real que a ProTune mandou no pacote
       Serial.printf("[TELEMETRIA-MOTOR]  RPM: %u | MARCHA: %d (ECU:%d) | Vm: %.1fKmh | TEMP: %.1fC | TPS: %.1f%% | BAT: %.1fV | OLEO: %.2fbar | COMB: %.2fbar | LAMBDA: %.3f\n",
                     ecu_rpm, calc_gear, ecu_gear, v_kmh, temp_c, tps_pct, bat_v, oil_bar, fuel, lambda);
+    */
     }
 
     /* 4. Estatísticas de CRC a cada 5s */
@@ -1334,13 +1334,10 @@ static void task_hmi(void *arg) {
          * ======================================================== */
     int8_t fast_gear = calcularMarchaInstantanea(v_kmh, rpm);
 
-    // Se a matemática disser "0", usamos a marcha da ProTune.
-    // Isso resolve o problema de mostrar a 1ª marcha no grid de largada.
     int8_t current_gear = (fast_gear != 0) ? fast_gear : ecu_gear;
 
     if (now - lastLedUpdate >= LED_UPDATE_MS) {
       lastLedUpdate = now;
-      updateAlertLEDs();
       updateRPMBar(rpm, current_gear);
     }
 
@@ -1371,20 +1368,27 @@ static void task_hmi(void *arg) {
 }
 
 /* ============================================================================
- * TASK DE ANÁLISE E ALERTAS (CORE 1)
+ * TASK DE ANÁLISE, ALERTAS E CONTROLE DE LEDS (CORE 1)
  * ============================================================================ */
 static void task_alerts(void *arg) {
   (void)arg;
   Serial.printf("[TASK] task_alerts no core %d\n", xPortGetCoreID());
 
-  /* Variáveis de estado para garantir que o gatilho só dispare UMA VEZ na mudança */
+  /* Variáveis de estado para garantir que o gatilho (Serial/4G) só dispare UMA VEZ */
   bool stateBat = false;
   bool stateTemp = false;
   bool stateOil = false;
   bool stateFuel = false;
 
+  /* Timers para o controle não-bloqueante do pisca-pisca */
+  uint32_t lastBlinkBat = 0;
+  uint32_t lastBlinkTemp = 0;
+  uint32_t lastBlinkOil = 0;
+
   while (1) {
-    /* 1. Coleta os dados de forma thread-safe */
+    uint32_t now = millis();
+    
+    /* 1. Coleta os dados de forma thread-safe uma ÚNICA vez por ciclo */
     float bat_v, temp_c, oil_bar, fuel_ps;
     uint16_t rpm;
 
@@ -1396,69 +1400,122 @@ static void task_alerts(void *arg) {
     rpm = g_ecu.engine_rpm;
     xSemaphoreGive(g_dataMutex);
 
-    /* 2. Análise da Bateria (Abaixo de 11.5V ou Acima de 14.8V) */
+    /* ====================================================================
+     * 2. Análise da Bateria (Abaixo de 11.5V ou Acima de 15.8V)
+     * ==================================================================== */
     if (bat_v <= LIMIT_BAT_MIN || bat_v >= LIMIT_BAT_MAX) {
       if (!stateBat) {
         stateBat = true;
         onBatWarningEnter();
+      }
+
+      /* Lógica Visual da Bateria */
+      if (bat_v >= LIMIT_BAT_MAX) {
+        // Sobrecarga do alternador: Pisca o LED
+        if (now - lastBlinkBat >= LED_BLINK_INTERVAL_MS) {
+          digitalWrite(LED_VOLT_BAT, !digitalRead(LED_VOLT_BAT));
+          lastBlinkBat = now;
+        }
+      } else {
+        // Tensão baixa: LED Aceso Fixo
+        digitalWrite(LED_VOLT_BAT, HIGH);
       }
     } else {
       if (stateBat) {
         stateBat = false;
         onBatWarningExit();
       }
+      digitalWrite(LED_VOLT_BAT, LOW);
     }
 
-    /* 3. Análise da Temperatura */
+    /* ====================================================================
+     * 3. Análise da Temperatura (Com Histerese Visual)
+     * ==================================================================== */
     if (temp_c >= LIMIT_TEMP_MAX) {
       if (!stateTemp) {
         stateTemp = true;
         onTempWarningEnter();
       }
-    } else {
-      // Usa 90 graus para evitar que o LED fique piscando se a temp ficar em 94.9 e 95.0 (Histerese)
-      if (stateTemp && temp_c < (LIMIT_TEMP_MAX - 5.0f)) {
-        stateTemp = false;
-        onTempWarningExit();
-      }
+    } else if (stateTemp && temp_c < (LIMIT_TEMP_MAX - 5.0f)) {
+      // O LED só vai parar de piscar quando a temperatura cair 5 graus
+      stateTemp = false;
+      onTempWarningExit();
     }
 
-    /* 4. Análise do Óleo (Ignora se o motor estiver desligado) */
+    /* Lógica Visual da Temperatura amarrada ao Estado */
+    if (stateTemp) {
+      if (now - lastBlinkTemp >= LED_BLINK_INTERVAL_MS) {
+        digitalWrite(LED_TEMP_AGUA, !digitalRead(LED_TEMP_AGUA));
+        lastBlinkTemp = now;
+      }
+    } else {
+      digitalWrite(LED_TEMP_AGUA, LOW);
+    }
+
+    /* ====================================================================
+     * 4. Análise do Óleo (Ignora se o motor estiver desligado)
+     * ==================================================================== */
     if (rpm > 800) {
+      // Evento Crítico (Abaixo de 0.5 Bar)
       if (oil_bar <= LIMIT_OIL_MIN) {
         if (!stateOil) {
           stateOil = true;
           onOilWarningEnter();
+        }
+        
+        // Pisca alertando risco iminente de quebra
+        if (now - lastBlinkOil >= LED_BLINK_INTERVAL_MS) {
+          digitalWrite(LED_PRESS_OLEO, !digitalRead(LED_PRESS_OLEO));
+          lastBlinkOil = now;
         }
       } else {
         if (stateOil) {
           stateOil = false;
           onOilWarningExit();
         }
+        
+        // Lógica de Atenção Secundária (Abaixo de 3.0 Bar acende fixo)
+        if (oil_bar < 3.0f) {
+          digitalWrite(LED_PRESS_OLEO, HIGH);
+        } else {
+          digitalWrite(LED_PRESS_OLEO, LOW);
+        }
       }
     } else {
-      /* Se o motor apagou, não queremos acender o alerta de óleo */
+      /* Se o motor apagou, reseta tudo e não acende alerta */
       if (stateOil) {
         stateOil = false;
         onOilWarningExit();
       }
+      digitalWrite(LED_PRESS_OLEO, LOW);
     }
 
-    /* 5. Análise do Combustível */
-    if (rpm > 800)
+    /* ====================================================================
+     * 5. Análise do Combustível
+     * ==================================================================== */
+    if (rpm > 800) {
       if (fuel_ps <= LIMIT_FUEL_MIN) {
         if (!stateFuel) {
           stateFuel = true;
           onFuelWarningEnter();
         }
+        digitalWrite(LED_COMB, HIGH);
       } else {
         if (stateFuel) {
           stateFuel = false;
           onFuelWarningExit();
         }
+        digitalWrite(LED_COMB, LOW);
       }
+    } else {
+       if (stateFuel) {
+         stateFuel = false;
+         onFuelWarningExit();
+       }
+       digitalWrite(LED_COMB, LOW);
+    }
 
-    /* Varre a cada 100ms (10 Hz é mais que suficiente para alertas visuais) */
+    /* Varre a cada 100ms. Suficiente para checagens de alerta e para o toggle do Blink */
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
@@ -1470,30 +1527,32 @@ static void task_4g(void *arg) {
     (void)arg;
     Serial.printf("[TASK] task_4g no core %d\n", xPortGetCoreID());
 
-    /* 1. Liga e Conecta (Pode demorar, mas como é uma Task, não trava o CAN) */
+    /* 1. Liga e Conecta com a rede 4G */
     powerOnModem();
     while (!initGSM()) {
-        vTaskDelay(pdMS_TO_TICKS(5000)); // Tenta de novo a cada 5 segundos se falhar
+        Serial.println("[4G] Retentando conexao GSM em 10s...");
+        vTaskDelay(pdMS_TO_TICKS(10000)); 
     }
 
-    /* 2. Loop Principal de Envio */
+    while (!testServerConnection()) {
+        Serial.println("[4G] Aguardando Render ligar. Novo ping em 5s...");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+
+    /* 2. Loop Principal de Envio (Telemetria) */
     while (1) {
         if (g_carState == CAR_MOVING) {
-            /* Variáveis para receber os dados crus e processados */
             float temp_c, v_kmh, oil_bar;
             uint16_t rpm, raw_diant, raw_tras;
             int16_t raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz;
             
-            /* Coleta super rápida e segura do Mutex global */
             xSemaphoreTake(g_dataMutex, portMAX_DELAY);
             temp_c    = g_ecu.engine_temp * PT_TEMP_SCALE;
             v_kmh     = g_ecu.vehicle_speed * PT_VSPD_SCALE;
             oil_bar   = g_ecu.oil_pressure * PT_OIL_SCALE;
             rpm       = g_ecu.engine_rpm;
-            
             raw_diant = g_pedals.press_freio_diant;
             raw_tras  = g_pedals.press_freio_tras;
-            
             raw_ax    = g_imu.accel_x;
             raw_ay    = g_imu.accel_y;
             raw_az    = g_imu.accel_z;
@@ -1502,7 +1561,6 @@ static void task_4g(void *arg) {
             raw_gz    = g_imu.gyro_z;
             xSemaphoreGive(g_dataMutex);
             
-            // 1. Freios para PSI
             float f_diant = (float)raw_diant;
             float f_tras  = (float)raw_tras;
             if (f_diant < FREIO_ADC_MIN) f_diant = FREIO_ADC_MIN;
@@ -1510,7 +1568,6 @@ static void task_4g(void *arg) {
             float psi_diant = ((f_diant - FREIO_ADC_MIN) / (FREIO_ADC_MAX - FREIO_ADC_MIN)) * FREIO_PSI_MAX;
             float psi_tras  = ((f_tras  - FREIO_ADC_MIN) / (FREIO_ADC_MAX - FREIO_ADC_MIN)) * FREIO_PSI_MAX;
 
-            // 2. IMU para G's e Graus por Segundo (dps)
             float ax_g = raw_ax * ACCEL_SCALE;
             float ay_g = raw_ay * ACCEL_SCALE;
             float az_g = raw_az * ACCEL_SCALE;
@@ -1518,37 +1575,33 @@ static void task_4g(void *arg) {
             float gy_dps = raw_gy * GYRO_SCALE;
             float gz_dps = raw_gz * GYRO_SCALE;
 
-            /* --- Monta o JSON --- 
-               Tamanho aumentado para 512 bytes para caber o novo payload completo */
             char jsonBuffer[512];
             snprintf(jsonBuffer, sizeof(jsonBuffer),
                 "{"
-                "\"lap-name\": \"%s\","
-                "\"temperature\": \"%.1f\","
-                "\"speed\": \"%.1f\","
-                "\"pressure\": \"%.2f\","
-                "\"rpm\": \"%u\","
-                "\"brake_front\": \"%.1f\","
-                "\"brake_rear\": \"%.1f\","
-                "\"accel_x\": \"%.2f\","
-                "\"accel_y\": \"%.2f\","
-                "\"accel_z\": \"%.2f\","
-                "\"gyro_x\": \"%.2f\","
-                "\"gyro_y\": \"%.2f\","
-                "\"gyro_z\": \"%.2f\""
+                "\"lap-name\":\"%s\","
+                "\"temperature\":\"%.1f\","
+                "\"speed\":\"%.1f\","
+                "\"pressure\":\"%.2f\","
+                "\"rpm\":\"%u\","
+                "\"brake_front\":\"%.1f\","
+                "\"brake_rear\":\"%.1f\","
+                "\"accel_x\":\"%.2f\","
+                "\"accel_y\":\"%.2f\","
+                "\"accel_z\":\"%.2f\","
+                "\"gyro_x\":\"%.2f\","
+                "\"gyro_y\":\"%.2f\","
+                "\"gyro_z\":\"%.2f\""
                 "}", 
                 g_currentLapName, temp_c, v_kmh, oil_bar, rpm,
                 psi_diant, psi_tras,
                 ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps
             );
 
-            /* Envia pro servidor (bloqueia apenas a Task 4G, liberando o resto do carro) */
             sendTelemetryPost(jsonBuffer);
             
-            /* Taxa de envio: a cada 2 segundos enquanto estiver andando */
+            // Taxa de envio: aguarda 2s antes do próximo POST
             vTaskDelay(pdMS_TO_TICKS(2000)); 
         } else {
-            /* Carro parado = dorme para não processar coisas à toa */
             vTaskDelay(pdMS_TO_TICKS(500));
         }
     }
@@ -1659,7 +1712,7 @@ void setup() {
   xTaskCreatePinnedToCore(task_sd, "task_sd", TASK_SD_STACK, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(task_hmi, "task_hmi", 4096, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(task_alerts, "task_alerts", 2048, NULL, 1, NULL, 1);
-  xTaskCreatePinnedToCore(task_4g, "task_4g", 8192, NULL, 1, NULL, 0);
+  //xTaskCreatePinnedToCore(task_4g, "task_4g", 8192, NULL, 0, NULL, 0);
 
   Serial.println("[SYS] Pronto. Aguardando botao de lap...");
 }
