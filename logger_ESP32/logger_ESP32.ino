@@ -71,6 +71,10 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
 /* ============================================================================
  * PINOUT
  * ============================================================================ */
@@ -96,19 +100,30 @@
 #define BTN_PAGE_PIN        2
 
 /* LEDs de aviso */
-#define LED_VOLT_BAT        21
-#define LED_TEMP_AGUA       22
-#define LED_PRESS_OLEO      32
-#define LED_STATUS_REC      33
+#define LED_VOLT_BAT        4
+#define LED_TEMP_AGUA       3
+#define LED_COMB            32
+#define LED_PRESS_OLEO      33
+
+/* ============================================================================
+ * LIMITES DE ALERTA (THRESHOLDS)
+ * ============================================================================ */
+#define LIMIT_BAT_MIN       11.5f   // Volts
+#define LIMIT_BAT_MAX       14.8f   // Volts (Alerta de sobrecarga)
+#define LIMIT_TEMP_MAX      95.0f   // Graus Celsius
+#define LIMIT_OIL_MIN       0.1f    // Bar 
+#define LIMIT_FUEL_MIN      0.1f   // Bar
+
+#define LED_STATUS_REC      34
 
 /* ============================================================================
  * BARRA WS2812B DE RPM
  * ============================================================================ */
 #define RPM_LED_COUNT       8
-#define RPM_MIN             3000
-#define RPM_MAX             13000
-#define RPM_SHIFT_WARN      11500
-#define RPM_SHIFT_CRIT      12500
+#define RPM_MIN             1000
+#define RPM_MAX             11000
+#define RPM_SHIFT_WARN      9000
+#define RPM_SHIFT_CRIT      10000
 #define RPM_LED_BRIGHTNESS  80
 
 /* ============================================================================
@@ -119,6 +134,21 @@
 #define CAN_ID_PEDAIS       0x202
 #define CAN_ID_PROTUNE      0x1E0
 
+#define FREIO_PSI_MAX        1100.0f  // PSI máximo a 4,5V
+#define FREIO_ADC_MIN        430.0f   // Leitura crua do ADC com o pedal SOLTO (0 PSI)
+#define FREIO_ADC_MAX        4095.0f  // Leitura crua máxima do ADC
+
+/* ============================================================================
+ * MATEMÁTICA DE TRANSMISSÃO E MARCHA INSTANTÂNEA (Setup 2025)
+ * ============================================================================ */
+#define RAIO_PNEU_M   0.2438f
+#define REDUCAO_IP    1.955f
+#define REDUCAO_IC    3.642857f
+#define REDLINE_RPM   10700      // Corte do motor real
+#define V_MIN_KMH     3.0f       // Velocidade mínima para a física fazer sentido
+#define RPM_MIN_CALC  800.0f     // Evita cálculos com motor afogando
+
+const float GEAR_RATIOS[6] = {2.846f, 1.947f, 1.556f, 1.333f, 1.190f, 1.083f};
 /* ============================================================================
  * ESTRUTURAS DE DADOS
  * ============================================================================ */
@@ -130,9 +160,13 @@ typedef struct {
     float ax_g, ay_g, az_g;
     float gx_dps, gy_dps, gz_dps;
 
-    /* Pedais */
+    /* Pedais e Freio */
     float hall_acel_pct;
     float hall_freio_pct;
+
+    /* Pressão de freio em PSI */
+    float press_freio_diant_psi;
+    float press_freio_tras_psi;
 
     /* Pressão de freio (raw ADC 0–4095; sem calibração bar definida) */
     uint16_t press_freio_diant_raw;
@@ -182,6 +216,11 @@ typedef struct {
     uint16_t press_freio_tras;
 } Pedals_Raw_t;
 
+typedef enum {
+    CAR_STOPPED,
+    CAR_MOVING
+} CarState_t;
+
 /* ============================================================================
  * CONSTANTES DE CONVERSÃO
  * ============================================================================ */
@@ -213,12 +252,19 @@ typedef struct {
 #define SAMPLE_PERIOD_MS        20
 #define SD_FLUSH_INTERVAL_MS    1000
 #define LED_BLINK_INTERVAL_MS   250
-#define DISPLAY_UPDATE_MS       100
+#define DISPLAY_UPDATE_MS       50
 #define LED_UPDATE_MS           50
 
 #define LOG_QUEUE_SIZE          100
 #define TASK_CAN_STACK          8192
 #define TASK_SD_STACK           8192
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C // Endereço 7-bit padrão (no seu módulo marca 0x78 em 8-bit, o que equivale a 0x3C)
+
+static Adafruit_SSD1306 g_oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 /* ============================================================================
  * VARIÁVEIS GLOBAIS
@@ -239,7 +285,7 @@ static volatile uint32_t g_protuneCrcOk     = 0;
 static bool g_sdAvailable = false; //Bypass SD
 
 static uint8_t g_displayPage = 0; 
-#define MAX_DISPLAY_PAGES    4
+#define MAX_DISPLAY_PAGES    5
 
 /* Instância MCP2515 (usa VSPI default do ESP32) */
 static MCP_CAN       CAN0(MCP2515_CS_PIN);
@@ -250,6 +296,19 @@ static SPIClass      spiSD(HSPI);
 /* Periféricos do volante */
 static CRGB          g_rpmLeds[RPM_LED_COUNT];
 static TM1637Display g_display(DISPLAY_CLK_PIN, DISPLAY_DIO_PIN);
+
+static CarState_t g_carState = CAR_STOPPED;
+
+static void onCarStartMoving() {
+    Serial.println("[MOVIMENTO] Carro entrou em MOVIMENTO!");
+    
+}
+
+/* Gatilho disparado UMA VEZ quando o carro para */
+static void onCarStopMoving() {
+    Serial.println("[MOVIMENTO] Carro PAROU!");
+    
+}
 
 /* ============================================================================
  * DECODIFICAÇÃO ProTune PR440 — manual oficial 03/2024 R1
@@ -276,6 +335,98 @@ static uint8_t CheckSumCAN(const uint8_t *ss)
         checksum += *ss++;
     }
     return checksum;
+}
+
+static int calcularBarraRPM(float rpm_atual, float rpm_max, int n, float rpm_min) {
+    if (rpm_max <= rpm_min) return 0;
+    
+    float frac = (rpm_atual - rpm_min) / (rpm_max - rpm_min);
+    
+    /* Limita a fração entre 0.0 e 1.0 (Clamp) */
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    
+    return round(frac * n);
+}
+
+static int8_t calcularMarchaInstantanea(float v_kmh, uint16_t rpm_motor) {
+    if (v_kmh < V_MIN_KMH || rpm_motor < RPM_MIN_CALC) {
+        return 0; // Indeterminado (parado ou debreando no grid)
+    }
+
+    /* RPM da roda: v(km/h) / 3.6 = v(m/s). 
+     * rpm_roda = v(m/s) * 60 / (2 * PI * RAIO) */
+    float rpm_roda = (v_kmh / 3.6f) * 60.0f / (2.0f * PI * RAIO_PNEU_M);
+    
+    if (rpm_roda <= 0.1f) return 0;
+
+    float ir_medido = (float)rpm_motor / rpm_roda;
+
+    int8_t melhor_marcha = 0;
+    float menor_erro = 999.0f;
+    const float tolerancia = 0.15f; // 15% de margem (cobre variação de pneu e pequeno wheelspin)
+
+    for (int i = 0; i < 6; i++) {
+        float ir_teorico = REDUCAO_IP * GEAR_RATIOS[i] * REDUCAO_IC;
+        float erro = abs(ir_teorico - ir_medido) / ir_teorico;
+        
+        if (erro < menor_erro) {
+            menor_erro = erro;
+            melhor_marcha = i + 1; // Marchas de 1 a 6
+        }
+    }
+
+    if (menor_erro <= tolerancia) {
+        return melhor_marcha;
+    }
+    
+    /* Se o erro for > 15%, o pneu está patinando muito forte ou travado no freio */
+    return 0; 
+}
+
+/* ============================================================================
+ * EVENTOS DE ALERTA (GATILHOS)
+ * ============================================================================ */
+
+/* --- BATERIA --- */
+static void onBatWarningEnter() {
+    Serial.println("[ALERTA] Bateria fora do ideal! Ativando LED.");
+    digitalWrite(LED_VOLT_BAT, HIGH);
+    // Aqui você também poderia mandar um JSON via 4G avisando os boxes
+}
+static void onBatWarningExit() {
+    Serial.println("[ALERTA] Bateria Normalizada. Desativando LED.");
+    digitalWrite(LED_VOLT_BAT, LOW);
+}
+
+/* --- TEMPERATURA DA ÁGUA --- */
+static void onTempWarningEnter() {
+    Serial.println("[ALERTA] Superaquecimento da Água! Ativando LED.");
+    digitalWrite(LED_TEMP_AGUA, HIGH);
+}
+static void onTempWarningExit() {
+    Serial.println("[ALERTA] Temperatura Normalizada. Desativando LED.");
+    digitalWrite(LED_TEMP_AGUA, LOW);
+}
+
+/* --- PRESSÃO DE ÓLEO --- */
+static void onOilWarningEnter() {
+    Serial.println("[ALERTA CRÍTICO] Baixa Pressão de Óleo! Ativando LED.");
+    digitalWrite(LED_PRESS_OLEO, HIGH);
+}
+static void onOilWarningExit() {
+    Serial.println("[ALERTA] Pressão de Óleo Normalizada. Desativando LED.");
+    digitalWrite(LED_PRESS_OLEO, LOW);
+}
+
+/* --- COMBUSTÍVEL --- */
+static void onFuelWarningEnter() {
+    Serial.println("[ALERTA] Combustível na Reserva! Ativando LED.");
+    digitalWrite(LED_COMB, HIGH);
+}
+static void onFuelWarningExit() {
+    Serial.println("[ALERTA] Combustível Normalizado (Reabastecido). Desativando LED.");
+    digitalWrite(LED_COMB, LOW);
 }
 
 /* ============================================================================
@@ -421,6 +572,17 @@ static void buildSnapshot(LogSample_t *s)
     s->press_freio_diant_raw = g_pedals.press_freio_diant;
     s->press_freio_tras_raw  = g_pedals.press_freio_tras;
 
+    /* Leitura bruta e trava em zero (evita PSI negativo se o ADC flutuar) */
+    float raw_diant = (float)g_pedals.press_freio_diant;
+    float raw_tras  = (float)g_pedals.press_freio_tras;
+
+    if (raw_diant < FREIO_ADC_MIN) raw_diant = FREIO_ADC_MIN;
+    if (raw_tras  < FREIO_ADC_MIN) raw_tras  = FREIO_ADC_MIN;
+
+    /* Conversão final para PSI */
+    s->press_freio_diant_psi = ((raw_diant - FREIO_ADC_MIN) / (FREIO_ADC_MAX - FREIO_ADC_MIN)) * FREIO_PSI_MAX;
+    s->press_freio_tras_psi  = ((raw_tras  - FREIO_ADC_MIN) / (FREIO_ADC_MAX - FREIO_ADC_MIN)) * FREIO_PSI_MAX;
+
     s->rpm               = g_ecu.engine_rpm;
     s->ign_angle_deg     = g_ecu.ign_angle       * PT_IGN_SCALE;
     s->gear              = (int8_t)g_ecu.gear_position;
@@ -526,45 +688,41 @@ static void updateAlertLEDs(void)
  * BARRA WS2812B DE RPM
  * ============================================================================ */
 
-static void updateRPMBar(uint16_t rpm)
+static void updateRPMBar(uint16_t rpm, int8_t gear)
 {
     static uint32_t lastBlink  = 0;
     static bool     blinkState = false;
     const uint32_t now = millis();
 
-    if (rpm >= RPM_SHIFT_CRIT) {
+    /* Limites baseados no Shift Light (Corte em 10700 RPM) */
+    uint16_t shift_rpm = REDLINE_RPM;      
+    uint16_t crit_rpm  = shift_rpm - 300;
+    uint16_t min_rpm   = shift_rpm * 0.3f;
+
+    /* Alerta Crítico de Troca (Shift Light estourando) */
+    if (rpm >= crit_rpm) {
         if (now - lastBlink >= 60) {
             blinkState = !blinkState;
             lastBlink  = now;
         }
+        /* Pisca tudo em Azul e Vermelho alternado para chamar muita atenção */
         CRGB color = blinkState ? CRGB::Blue : CRGB::Red;
         for (int i = 0; i < RPM_LED_COUNT; i++) g_rpmLeds[i] = color;
         FastLED.show();
         return;
     }
 
-    if (rpm >= RPM_SHIFT_WARN) {
-        if (now - lastBlink >= 120) {
-            blinkState = !blinkState;
-            lastBlink  = now;
-        }
-        CRGB color = blinkState ? CRGB::Red : CRGB::Black;
-        for (int i = 0; i < RPM_LED_COUNT; i++) g_rpmLeds[i] = color;
-        FastLED.show();
-        return;
-    }
-
-    int ledsOn = 0;
-    if (rpm > RPM_MIN) {
-        ledsOn = map(rpm, RPM_MIN, RPM_MAX, 0, RPM_LED_COUNT);
-        if (ledsOn > RPM_LED_COUNT) ledsOn = RPM_LED_COUNT;
-    }
+    /* Quantos LEDs acender com base na matemática? */
+    int ledsOn = calcularBarraRPM((float)rpm, (float)shift_rpm, RPM_LED_COUNT, (float)min_rpm);
 
     for (int i = 0; i < RPM_LED_COUNT; i++) {
         if (i < ledsOn) {
-            if      (i < 3) g_rpmLeds[i] = CRGB::Green;
-            else if (i < 6) g_rpmLeds[i] = CRGB::Yellow;
-            else            g_rpmLeds[i] = CRGB::Red;
+            /* Mapeia a cor: LED 0 = Verde (96) -----> LED Final = Vermelho (0) 
+             * Fica progressivamente mais vermelho quanto mais próximo do limite */
+            uint8_t hue = map(i, 0, RPM_LED_COUNT - 1, 96, 0); 
+            
+            /* Seta a cor usando o padrão HSV (Cor, Saturação máxima, Brilho máximo) */
+            g_rpmLeds[i] = CHSV(hue, 255, 255);
         } else {
             g_rpmLeds[i] = CRGB::Black;
         }
@@ -620,8 +778,8 @@ static void updateDisplay(uint16_t rpm, int8_t gear, float temp_c, float bat_v, 
         case 1: /* Página 1: Temperatura (C XX) */
             segs[0] = CHAR_C;
             segs[1] = 0; // Espaço
-            g_display.setSegments(segs, 2, 0); // Desenha os 2 primeiros
-            g_display.showNumberDec((int)temp_c, false, 2, 2); // Desenha os 2 últimos
+            g_display.setSegments(segs, 3, 0); // Desenha os 2 primeiros
+            g_display.showNumberDec((int)temp_c, false, 3, 1); // Desenha os 2 últimos
             break;
 
         case 2: /* Página 2: Bateria (U XX.X) */
@@ -637,16 +795,91 @@ static void updateDisplay(uint16_t rpm, int8_t gear, float temp_c, float bat_v, 
             break;
         }
 
-        case 3: /* Página 3: Lambda (L .XXX) */
+case 3: /* Página 3: Lambda (L .XXX) */
         {
             segs[0] = CHAR_L;
             g_display.setSegments(segs, 1, 0);
-            
-            // Ex: Lambda 0.980 -> mostramos "980" nos 3 últimos dígitos.
             int lam_display = (int)(lambda * 1000.0f);
             g_display.showNumberDec(lam_display, true, 3, 1); 
             break;
         }
+
+        case 4: /* Página 4: Marcha Fixa */
+        {
+            segs[0] = 0;      // Apagado
+            segs[1] = 0;      // Apagado
+            segs[2] = 0;      // <-- Aqui estava o CHAR_G que parecia um '6'. Agora fica apagado!
+            
+            if (gear == 0) {
+                segs[3] = CHAR_N; // 'n' para ponto morto
+            } else if (gear > 0 && gear <= 9) {
+                segs[3] = g_display.encodeDigit(gear);
+            } else if (gear < 0) {
+                segs[3] = CHAR_R; // 'r' para ré
+            }
+            
+            g_display.setSegments(segs);
+            break;
+        }
+    }
+}
+
+static void updateBrakeBiasDisplay() {
+    static float last_diant = -999.0f;
+    static float last_tras  = -999.0f;
+    const float  NOISE_DEADBAND = 2.0f; // Atualiza a tela só se a pressão variar > 2 PSI
+
+    uint16_t raw_diant, raw_tras;
+    
+    /* Coleta segura das variáveis brutas */
+    xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+    raw_diant = g_pedals.press_freio_diant;
+    raw_tras  = g_pedals.press_freio_tras;
+    xSemaphoreGive(g_dataMutex);
+
+    /* Tratamento do limite mínimo do ADC */
+    float f_diant = (float)raw_diant;
+    float f_tras  = (float)raw_tras;
+    if (f_diant < FREIO_ADC_MIN) f_diant = FREIO_ADC_MIN;
+    if (f_tras  < FREIO_ADC_MIN) f_tras  = FREIO_ADC_MIN;
+
+    /* Conversão final para PSI */
+    float psi_diant = ((f_diant - FREIO_ADC_MIN) / (FREIO_ADC_MAX - FREIO_ADC_MIN)) * FREIO_PSI_MAX;
+    float psi_tras  = ((f_tras  - FREIO_ADC_MIN) / (FREIO_ADC_MAX - FREIO_ADC_MIN)) * FREIO_PSI_MAX;
+
+    /* Verifica se houve mudança real (histerese) para poupar processamento I2C */
+    if (abs(psi_diant - last_diant) > NOISE_DEADBAND || abs(psi_tras - last_tras) > NOISE_DEADBAND) {
+        last_diant = psi_diant;
+        last_tras  = psi_tras;
+
+        float total_psi = psi_diant + psi_tras;
+        float pct_diant = 0.0f;
+        float pct_tras  = 0.0f;
+
+        /* Evita divisão por zero e exibe porcentagem real apenas se houver pressão mínima no sistema */
+        if (total_psi > 10.0f) { 
+            pct_diant = (psi_diant / total_psi) * 100.0f;
+            pct_tras  = (psi_tras / total_psi) * 100.0f;
+        } else {
+            pct_diant = 50.0f; // Valor neutro quando os pedais estão soltos
+            pct_tras  = 50.0f;
+        }
+
+        /* Rotina de desenho na tela OLED */
+        g_oled.clearDisplay();
+        
+        g_oled.setTextSize(1);
+        g_oled.setCursor(0, 0);
+        g_oled.println("BRAKE BIAS (BALANCO)");
+
+        g_oled.setTextSize(2); // Texto grande para facilitar leitura com o carro em movimento
+        g_oled.setCursor(0, 20);
+        g_oled.printf("DIANT: %.0f%%\n", pct_diant);
+        
+        g_oled.setCursor(0, 45);
+        g_oled.printf("TRAS : %.0f%%\n", pct_tras);
+
+        g_oled.display();
     }
 }
 
@@ -702,7 +935,7 @@ static void writeSampleToSD(const LogSample_t *s)
         "%.4f,%.4f,%.4f,"
         "%.2f,%.2f,%.2f,"
         "%.1f,%.1f,"
-        "%u,%u,"
+        "%.1f,%.1f," // <-- Aqui as variaveis float de PSI
         "%u,%.1f,%d,"
         "%.1f,%.1f,%.1f,%.1f,"
         "%.1f,%.3f,"
@@ -712,7 +945,7 @@ static void writeSampleToSD(const LogSample_t *s)
         s->ax_g, s->ay_g, s->az_g,
         s->gx_dps, s->gy_dps, s->gz_dps,
         s->hall_acel_pct, s->hall_freio_pct,
-        s->press_freio_diant_raw, s->press_freio_tras_raw,
+        s->press_freio_diant_psi, s->press_freio_tras_psi, // <-- Trocado os RAWs velhos por PSI
         s->rpm, s->ign_angle_deg, s->gear,
         s->map_kpa, s->iat_c, s->engine_temp_c, s->throttle_pct,
         s->battery_v, s->lambda1,
@@ -731,174 +964,26 @@ static void writeSampleToSD(const LogSample_t *s)
     }
 }
 
-/* ============================================================================
- * TASK CORE 1 — MCP2515 + LEDs + display
- * ============================================================================ */
-
-static void task_can(void *arg)
+static void handlePageButton(void)
 {
-    (void)arg;
-    Serial.printf("[TASK] task_can no core %d\n", xPortGetCoreID());
+    static bool     lastState   = HIGH;
+    static uint32_t lastChange  = 0;
+    const  uint32_t DEBOUNCE_MS = 50;
 
-    uint32_t lastSample     = 0;
-    uint32_t lastLedUpdate  = 0;
-    uint32_t lastDispUpdate = 0;
-    uint32_t lastStatsTime  = millis();
+    bool current = digitalRead(BTN_PAGE_PIN);
+    uint32_t now = millis();
 
-    while (1) {
-        /* Lê mensagens enquanto o pino INT estiver baixo.
-         * O MCP2515 pode ter até 2 mensagens em buffer (RXB0, RXB1),
-         * então drenamos até esvaziar. */
-        while (digitalRead(MCP2515_INT_PIN) == LOW) {
-            unsigned long canId = 0;
-            uint8_t       len   = 0;
-            uint8_t       buf[8];
+    if (current != lastState && (now - lastChange) >= DEBOUNCE_MS) {
+        lastChange = now;
 
-            if (CAN0.readMsgBuf(&canId, &len, buf) == CAN_OK) {
-                /* Ignora extended e RTR */
-                if (!(canId & 0x80000000UL) && !(canId & 0x40000000UL)) {
-                    uint32_t id = canId & 0x7FF;
-                    processCANMessage(id, buf, len);
-                }
-            } else {
-                break;  /* Evita loop infinito se leitura falhar */
+        if (current == LOW) { // Botão pressionado
+            g_displayPage++;
+            if (g_displayPage >= MAX_DISPLAY_PAGES) {
+                g_displayPage = 0; // Volta para a primeira página
             }
+            Serial.printf("[DISPLAY] Pagina alterada para: %d\n", g_displayPage);
         }
-
-        uint32_t now = millis();
-
-        /* Enfileira sample a 50 Hz */
-        if (g_recording && (now - lastSample >= SAMPLE_PERIOD_MS)) {
-            lastSample = now;
-            LogSample_t sample;
-            buildSnapshot(&sample);
-            if (xQueueSend(g_logQueue, &sample, 0) != pdTRUE) {
-                static uint32_t dropCount = 0;
-                dropCount++;
-                if (dropCount % 50 == 0) {
-                    Serial.printf("[WARN] Fila cheia, %lu descartados\n", dropCount);
-                }
-            }
-        }
-
-        /* LEDs + barra RPM a cada 50 ms */
-        if (now - lastLedUpdate >= LED_UPDATE_MS) {
-            lastLedUpdate = now;
-            updateAlertLEDs();
-
-            uint16_t rpm;
-            xSemaphoreTake(g_dataMutex, portMAX_DELAY);
-            rpm = g_ecu.engine_rpm;
-            xSemaphoreGive(g_dataMutex);
-
-            updateRPMBar(rpm);
-        }
-
-        /* Display a cada 100 ms */
-/* Display a cada 100 ms */
-        if (now - lastDispUpdate >= DISPLAY_UPDATE_MS) {
-            lastDispUpdate = now;
-            
-            uint16_t rpm;
-            int8_t   gear;
-            float    temp_c;
-            float    bat_v;
-            float    lambda_val;
-
-            xSemaphoreTake(g_dataMutex, portMAX_DELAY);
-            rpm        = g_ecu.engine_rpm;
-            gear       = (int8_t)g_ecu.gear_position;
-            temp_c     = g_ecu.engine_temp * PT_TEMP_SCALE;
-            bat_v      = g_ecu.battery_voltage * PT_BAT_SCALE;
-            lambda_val = g_ecu.lambda1 * PT_LAMBDA_SCALE;
-            xSemaphoreGive(g_dataMutex);
-            
-            updateDisplay(rpm, gear, temp_c, bat_v, lambda_val);
-        }
-
-        /* Estatísticas a cada 5s */
-        if (now - lastStatsTime >= 5000) {
-            lastStatsTime = now;
-            if (g_protuneCrcOk + g_protuneCrcErrors > 0) {
-                Serial.printf("[ProTune] OK=%lu  CRCerr=%lu\n",
-                              g_protuneCrcOk, g_protuneCrcErrors);
-            }
-        }
-
-static uint32_t lastDebugTime = 0;
-        if (now - lastDebugTime >= 1000) { // Atualiza a cada 1 segundo
-            lastDebugTime = now;
-
-            /* 1. Captura rápida de todos os dados protegidos pelo Mutex */
-            xSemaphoreTake(g_dataMutex, portMAX_DELAY);
-            
-            // Dados Chassi
-            int16_t raw_ax = g_imu.accel_x;
-            int16_t raw_ay = g_imu.accel_y;
-            int16_t raw_az = g_imu.accel_z;
-            int16_t raw_gx = g_imu.gyro_x;
-            int16_t raw_gy = g_imu.gyro_y;
-            int16_t raw_gz = g_imu.gyro_z;
-            uint16_t p_freio_diant = g_pedals.press_freio_diant;
-            uint16_t p_freio_tras  = g_pedals.press_freio_tras;
-            uint16_t hall_freio    = g_pedals.hall_freio;
-
-            // Dados Motor (ProTune)
-            uint16_t ecu_rpm    = g_ecu.engine_rpm;
-            int16_t  ecu_temp   = g_ecu.engine_temp;
-            int16_t  ecu_tps    = g_ecu.throttle_pos;
-            int16_t  ecu_bat    = g_ecu.battery_voltage;
-            int16_t  ecu_oil    = g_ecu.oil_pressure;
-            int16_t  ecu_lambda = g_ecu.lambda1;
-            
-            xSemaphoreGive(g_dataMutex);
-
-            /* 2. Conversões (Chassi) */
-            float ax_g = raw_ax * ACCEL_SCALE;
-            float ay_g = raw_ay * ACCEL_SCALE;
-            float az_g = raw_az * ACCEL_SCALE;
-            float gx = raw_gx * GYRO_SCALE;
-            float gy = raw_gy * GYRO_SCALE;
-            float gz = raw_gz * GYRO_SCALE;
-            float hall_freio_pct = (hall_freio * HALL_PCT_MAX) / HALL_ADC_MAX;
-
-            /* 3. Conversões (Motor) */
-            float temp_c  = ecu_temp * PT_TEMP_SCALE;
-            float tps_pct = ecu_tps  * PT_TP_SCALE;
-            float bat_v   = ecu_bat  * PT_BAT_SCALE;
-            float oil_bar = ecu_oil  * PT_OIL_SCALE;
-            float lambda  = ecu_lambda * PT_LAMBDA_SCALE;
-
-            /* 4. Impressão formatada */
-            Serial.printf("[TELEMETRIA-CHASSI] ACC(g): X=%.2f Y=%.2f Z=%.2f | GYRO: X=%.2f Y=%.2f Z=%.2f | FREIO(raw): D=%u T=%u | HALL_FR: %.1f%%\n",
-                          ax_g, ay_g, az_g, gx, gy, gz, p_freio_diant, p_freio_tras, hall_freio_pct);
-                          
-            Serial.printf("[TELEMETRIA-MOTOR]  RPM: %u | TEMP: %.1fC | TPS: %.1f%% | BAT: %.1fV | OLEO: %.2fbar | LAMBDA: %.3f\n",
-                          ecu_rpm, temp_c, tps_pct, bat_v, oil_bar, lambda);
-        }
-        /* ------------------------------------------------------------- */
-
-        /* Yield curto para não monopolizar o core */
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-}
-
-/* ============================================================================
- * TASK CORE 0 — Escrita no SD
- * ============================================================================ */
-
-static void task_sd(void *arg)
-{
-    (void)arg;
-    Serial.printf("[TASK] task_sd no core %d\n", xPortGetCoreID());
-
-    LogSample_t sample;
-    while (1) {
-        if (xQueueReceive(g_logQueue, &sample, portMAX_DELAY) == pdTRUE) {
-            if (g_recording) {
-                writeSampleToSD(&sample);
-            }
-        }
+        lastState = current;
     }
 }
 
@@ -947,26 +1032,327 @@ Serial.println("Botao <<<");
     }
 }
 
-static void handlePageButton(void)
-{
-    static bool     lastState   = HIGH;
-    static uint32_t lastChange  = 0;
-    const  uint32_t DEBOUNCE_MS = 50;
+/* Função que varre a velocidade em tempo real com Histerese */
+static void handleMotionState() {
+    static uint32_t timeAboveStartThresh = 0;
+    static uint32_t timeBelowStopThresh  = 0;
 
-    bool current = digitalRead(BTN_PAGE_PIN);
+    /* Configurações de Histerese */
+    const float    SPEED_START_KMH = 5.0f;  // Acima de 5km/h para considerar andando
+    const float    SPEED_STOP_KMH  = 2.0f;  // Abaixo de 2km/h para considerar parado
+    const uint32_t TIME_TO_CONFIRM = 500;   // 500ms de confirmação constante
+
+    /* Leitura segura da velocidade do mutex global */
+    float v_kmh;
+    xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+    v_kmh = g_ecu.vehicle_speed * PT_VSPD_SCALE;
+    xSemaphoreGive(g_dataMutex);
+
     uint32_t now = millis();
 
-    if (current != lastState && (now - lastChange) >= DEBOUNCE_MS) {
-        lastChange = now;
-
-        if (current == LOW) { // Botão pressionado
-            g_displayPage++;
-            if (g_displayPage >= MAX_DISPLAY_PAGES) {
-                g_displayPage = 0; // Volta para a primeira página
+    if (g_carState == CAR_STOPPED) {
+        if (v_kmh >= SPEED_START_KMH) {
+            if (timeAboveStartThresh == 0) {
+                timeAboveStartThresh = now; // Inicia o cronômetro
+            } else if (now - timeAboveStartThresh >= TIME_TO_CONFIRM) {
+                g_carState = CAR_MOVING;    // Confirma o movimento
+                onCarStartMoving();         // Dispara o evento
+                timeBelowStopThresh = 0;    // Reseta o cronômetro de parada
             }
-            Serial.printf("[DISPLAY] Pagina alterada para: %d\n", g_displayPage);
+        } else {
+            timeAboveStartThresh = 0;       // Reseta se a velocidade cair antes do tempo
         }
-        lastState = current;
+    } 
+    else if (g_carState == CAR_MOVING) {
+        if (v_kmh <= SPEED_STOP_KMH) {
+            if (timeBelowStopThresh == 0) {
+                timeBelowStopThresh = now;  // Inicia o cronômetro de parada
+            } else if (now - timeBelowStopThresh >= TIME_TO_CONFIRM) {
+                g_carState = CAR_STOPPED;   // Confirma a parada
+                onCarStopMoving();          // Dispara o evento
+                timeAboveStartThresh = 0;   // Reseta o cronômetro de movimento
+            }
+        } else {
+            timeBelowStopThresh = 0;        // Reseta se o carro voltar a acelerar antes do tempo
+        }
+    }
+}
+
+/* ============================================================================
+ * TASK CORE 1 — MCP2515 e LOG
+ * ============================================================================ */
+static void task_can(void *arg)
+{
+    (void)arg;
+    Serial.printf("[TASK] task_can no core %d\n", xPortGetCoreID());
+
+    uint32_t lastSample    = 0;
+    uint32_t lastStatsTime = millis();
+    static uint32_t lastDebugTime = 0;
+
+        while (1) {
+        /* 1. Drena o buffer do MCP2515 checando diretamente o chip via SPI (ignora o pino INT) */
+        unsigned long canId = 0;
+        uint8_t       len   = 0;
+        uint8_t       buf[8];
+
+        // Tenta ler o buffer 0 ou buffer 1 diretamente
+        while (CAN0.readMsgBuf(&canId, &len, buf) == CAN_OK) {
+            if (!(canId & 0x80000000UL) && !(canId & 0x40000000UL)) {
+                uint32_t id = canId & 0x7FF;
+                processCANMessage(id, buf, len);
+            }
+        }
+
+        uint32_t now = millis();
+
+        /* 2. Enfileira sample a 50 Hz para o SD */
+        if (g_recording && (now - lastSample >= SAMPLE_PERIOD_MS)) {
+            lastSample = now;
+            LogSample_t sample;
+            buildSnapshot(&sample);
+            if (xQueueSend(g_logQueue, &sample, 0) != pdTRUE) {
+                // Buffer cheio
+            }
+        }
+
+        /* 3. Imprime a Telemetria a cada 1s */
+        if (now - lastDebugTime >= 1000) { 
+            lastDebugTime = now;
+
+            xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+            int16_t raw_ax = g_imu.accel_x;
+            int16_t raw_ay = g_imu.accel_y;
+            int16_t raw_az = g_imu.accel_z;
+            int16_t raw_gx = g_imu.gyro_x;
+            int16_t raw_gy = g_imu.gyro_y;
+            int16_t raw_gz = g_imu.gyro_z;
+            uint16_t p_freio_diant = g_pedals.press_freio_diant;
+            uint16_t p_freio_tras  = g_pedals.press_freio_tras;
+            uint16_t hall_freio    = g_pedals.hall_freio;
+
+            uint16_t ecu_rpm    = g_ecu.engine_rpm;
+            int16_t  ecu_temp   = g_ecu.engine_temp;
+            int16_t  ecu_tps    = g_ecu.throttle_pos;
+            int16_t  ecu_bat    = g_ecu.battery_voltage;
+            int16_t  ecu_oil    = g_ecu.oil_pressure;
+            int16_t  ecu_fuel    = g_ecu.fuel_pressure;
+            int16_t  ecu_lambda = g_ecu.lambda1;
+            int16_t  ecu_vspd   = g_ecu.vehicle_speed;
+            int8_t   ecu_gear   = (int8_t)g_ecu.gear_position;
+            xSemaphoreGive(g_dataMutex);
+
+            /* Conversões do Chassi */
+            float ax_g = raw_ax * ACCEL_SCALE;
+            float ay_g = raw_ay * ACCEL_SCALE;
+            float az_g = raw_az * ACCEL_SCALE;
+            float gx = raw_gx * GYRO_SCALE;
+            float gy = raw_gy * GYRO_SCALE;
+            float gz = raw_gz * GYRO_SCALE;
+            float hall_freio_pct = (hall_freio * HALL_PCT_MAX) / HALL_ADC_MAX;
+
+            /* Freio em PSI */
+            float raw_diant = (float)p_freio_diant;
+            float raw_tras  = (float)p_freio_tras;
+            if (raw_diant < FREIO_ADC_MIN) raw_diant = FREIO_ADC_MIN;
+            if (raw_tras  < FREIO_ADC_MIN) raw_tras  = FREIO_ADC_MIN;
+            
+            float psi_diant = ((raw_diant - FREIO_ADC_MIN) / (FREIO_ADC_MAX - FREIO_ADC_MIN)) * FREIO_PSI_MAX;
+            float psi_tras  = ((raw_tras  - FREIO_ADC_MIN) / (FREIO_ADC_MAX - FREIO_ADC_MIN)) * FREIO_PSI_MAX;
+
+            /* Conversões do Motor */
+            float temp_c  = ecu_temp * PT_TEMP_SCALE;
+            float tps_pct = ecu_tps  * PT_TP_SCALE;
+            float bat_v   = ecu_bat  * PT_BAT_SCALE;
+            float oil_bar = ecu_oil  * PT_OIL_SCALE;
+            float fuel = ecu_fuel  * PT_FUEL_SCALE;
+            float lambda  = ecu_lambda * PT_LAMBDA_SCALE;
+            float v_kmh   = ecu_vspd * PT_VSPD_SCALE;
+
+            int8_t fast_gear = calcularMarchaInstantanea(v_kmh, ecu_rpm);
+            int8_t calc_gear = (fast_gear != 0) ? fast_gear : ecu_gear;
+
+/* Print */
+            Serial.printf("[TELEMETRIA-CHASSI] ACC(g): X=%.2f Y=%.2f Z=%.2f | GYRO: X=%.2f Y=%.2f Z=%.2f | FREIO(psi): D=%.1f T=%.1f | FREIO(raw): D=%u T=%u | HALL_FR: %.1f%%\n",
+                          ax_g, ay_g, az_g, gx, gy, gz, psi_diant, psi_tras, p_freio_diant, p_freio_tras, hall_freio_pct);
+                          
+            // Adicionado "MARCHA: X (ECU: Y)" para você ver a marcha calculada e a marcha real que a ProTune mandou no pacote
+            Serial.printf("[TELEMETRIA-MOTOR]  RPM: %u | MARCHA: %d (ECU:%d) | Vm: %.1fKmh | TEMP: %.1fC | TPS: %.1f%% | BAT: %.1fV | OLEO: %.2fbar | COMB: %.2fbar | LAMBDA: %.3f\n",
+                          ecu_rpm, calc_gear, ecu_gear, v_kmh, temp_c, tps_pct, bat_v, oil_bar, fuel, lambda);
+        }
+
+        /* 4. Estatísticas de CRC a cada 5s */
+        if (now - lastStatsTime >= 5000) {
+            lastStatsTime = now;
+            if (g_protuneCrcOk + g_protuneCrcErrors > 0) {
+               // Serial.printf("[ProTune] OK=%lu  CRCerr=%lu\n",
+               //               g_protuneCrcOk, g_protuneCrcErrors);
+            }
+        }
+
+        /* Yield ultracurto para não estourar Watchdog */
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+/* ============================================================================
+ * TASK CORE 0 — Escrita no SD
+ * ============================================================================ */
+
+static void task_sd(void *arg)
+{
+    (void)arg;
+    Serial.printf("[TASK] task_sd no core %d\n", xPortGetCoreID());
+
+    LogSample_t sample;
+    while (1) {
+        if (xQueueReceive(g_logQueue, &sample, portMAX_DELAY) == pdTRUE) {
+            if (g_recording) {
+                writeSampleToSD(&sample);
+            }
+        }
+    }
+}
+
+/* ============================================================================
+ * TASK CORE 0 — Interface (Painel, LEDs e Display)
+ * ============================================================================ */
+static void task_hmi(void *arg)
+{
+    (void)arg;
+    Serial.printf("[TASK] task_hmi no core %d\n", xPortGetCoreID());
+
+    uint32_t lastLedUpdate  = 0;
+    uint32_t lastDispUpdate = 0;
+    
+    int8_t last_gear_seen = -99;
+
+    while (1) {
+        uint32_t now = millis();
+
+        /* 1. Coleta super rápida via Mutex */
+        uint16_t rpm;
+        int8_t   ecu_gear;
+        float    v_kmh;
+        float    temp_c;
+        float    bat_v;
+        float    lambda_val;
+
+        xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+        rpm        = g_ecu.engine_rpm;
+        ecu_gear   = (int8_t)g_ecu.gear_position;
+        v_kmh      = g_ecu.vehicle_speed * PT_VSPD_SCALE;
+        temp_c     = g_ecu.engine_temp * PT_TEMP_SCALE;
+        bat_v      = g_ecu.battery_voltage * PT_BAT_SCALE;
+        lambda_val = g_ecu.lambda1 * PT_LAMBDA_SCALE;
+        xSemaphoreGive(g_dataMutex);
+
+        /* ========================================================
+         * 2. O CÉREBRO DA TRANSMISSÃO (Cálculo Instantâneo)
+         * ======================================================== */
+        int8_t fast_gear = calcularMarchaInstantanea(v_kmh, rpm);
+        
+        // Se a matemática disser "0", usamos a marcha da ProTune. 
+        // Isso resolve o problema de mostrar a 1ª marcha no grid de largada.
+        int8_t current_gear = (fast_gear != 0) ? fast_gear : ecu_gear;
+
+        if (now - lastLedUpdate >= LED_UPDATE_MS) {
+            lastLedUpdate = now;
+            updateAlertLEDs();
+            updateRPMBar(rpm, current_gear); 
+        }
+
+        /* Força tela instantânea caso o número da marcha mude */
+        bool forceDisplayUpdate = false;
+        if (current_gear != last_gear_seen) {
+            forceDisplayUpdate = true;
+            last_gear_seen = current_gear;
+        }
+
+        /* 4. Atualiza o LCD do Volante */
+        if ((now - lastDispUpdate >= DISPLAY_UPDATE_MS) || forceDisplayUpdate) {
+            lastDispUpdate = now;
+            updateDisplay(rpm, current_gear, temp_c, bat_v, lambda_val);
+        }
+
+        /* 4. Atualiza o LCD do Volante */
+        if ((now - lastDispUpdate >= DISPLAY_UPDATE_MS) || forceDisplayUpdate) {
+            lastDispUpdate = now;
+            updateDisplay(rpm, current_gear, temp_c, bat_v, lambda_val);
+            
+            /* 5. Atualiza o OLED de Freio se a pressão mudar */
+            updateBrakeBiasDisplay();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+/* ============================================================================
+ * TASK DE ANÁLISE E ALERTAS (CORE 1)
+ * ============================================================================ */
+static void task_alerts(void *arg) {
+    (void)arg;
+    Serial.printf("[TASK] task_alerts no core %d\n", xPortGetCoreID());
+
+    /* Variáveis de estado para garantir que o gatilho só dispare UMA VEZ na mudança */
+    bool stateBat  = false;
+    bool stateTemp = false;
+    bool stateOil  = false;
+    bool stateFuel = false;
+
+    while (1) {
+        /* 1. Coleta os dados de forma thread-safe */
+        float bat_v, temp_c, oil_bar, fuel_ps;
+        uint16_t rpm;
+
+        xSemaphoreTake(g_dataMutex, portMAX_DELAY);
+        bat_v    = g_ecu.battery_voltage * PT_BAT_SCALE;
+        temp_c   = g_ecu.engine_temp * PT_TEMP_SCALE;
+        oil_bar  = g_ecu.oil_pressure * PT_OIL_SCALE;
+        fuel_ps = g_ecu.fuel_pressure * PT_FUEL_SCALE;
+        rpm      = g_ecu.engine_rpm;
+        xSemaphoreGive(g_dataMutex);
+
+        /* 2. Análise da Bateria (Abaixo de 11.5V ou Acima de 14.8V) */
+        if (bat_v <= LIMIT_BAT_MIN || bat_v >= LIMIT_BAT_MAX) {
+            if (!stateBat) { stateBat = true; onBatWarningEnter(); }
+        } else {
+            if (stateBat) { stateBat = false; onBatWarningExit(); }
+        }
+
+        /* 3. Análise da Temperatura */
+        if (temp_c >= LIMIT_TEMP_MAX) {
+            if (!stateTemp) { stateTemp = true; onTempWarningEnter(); }
+        } else {
+            // Usa 90 graus para evitar que o LED fique piscando se a temp ficar em 94.9 e 95.0 (Histerese)
+            if (stateTemp && temp_c < (LIMIT_TEMP_MAX - 5.0f)) { 
+                stateTemp = false; onTempWarningExit(); 
+            }
+        }
+
+        /* 4. Análise do Óleo (Ignora se o motor estiver desligado) */
+        if (rpm > 800) {
+            if (oil_bar <= LIMIT_OIL_MIN) {
+                if (!stateOil) { stateOil = true; onOilWarningEnter(); }
+            } else {
+                if (stateOil) { stateOil = false; onOilWarningExit(); }
+            }
+        } else {
+            /* Se o motor apagou, não queremos acender o alerta de óleo */
+            if (stateOil) { stateOil = false; onOilWarningExit(); }
+        }
+
+        /* 5. Análise do Combustível */
+        if (rpm > 800)
+            if (fuel_ps <= LIMIT_FUEL_MIN) {
+                if (!stateFuel) { stateFuel = true; onFuelWarningEnter(); }
+            } else {
+                if (stateFuel) { stateFuel = false; onFuelWarningExit(); }
+            }
+
+        /* Varre a cada 100ms (10 Hz é mais que suficiente para alertas visuais) */
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -979,6 +1365,21 @@ void setup()
     Serial.begin(115200);
     delay(500);
 
+    /* Inicializa I2C (Pinos padrão ESP32: SDA=21, SCL=22) */
+    Wire.begin(21, 22);
+    
+    if(!g_oled.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+        Serial.println("[OLED] Falha ao inicializar o SSD1306");
+    } else {
+        g_oled.clearDisplay();
+        g_oled.setTextColor(SSD1306_WHITE);
+        g_oled.setTextSize(1);
+        g_oled.setCursor(0, 0);
+        g_oled.println("SISTEMA ROUTE");
+        g_oled.println("Aguardando Freio...");
+        g_oled.display();
+    }
+
     Serial.println();
     Serial.println("========================================");
     Serial.println(" Logger UFS-01B - Telemetria");
@@ -989,7 +1390,7 @@ void setup()
     pinMode(LED_VOLT_BAT,   OUTPUT);
     pinMode(LED_TEMP_AGUA,  OUTPUT);
     pinMode(LED_PRESS_OLEO, OUTPUT);
-    pinMode(LED_STATUS_REC, OUTPUT);
+    pinMode(LED_COMB, OUTPUT);
     pinMode(BTN_LAP_PIN,    INPUT_PULLDOWN);
     pinMode(BTN_PAGE_PIN,   INPUT_PULLDOWN);
 
@@ -1008,13 +1409,12 @@ void setup()
     g_display.setBrightness(5);
     g_display.clear();
 
-/* Inicializa HSPI para o SD (não conflita com VSPI do MCP2515) */
+    /* Inicializa HSPI para o SD (não conflita com VSPI do MCP2515) */
     spiSD.begin(HSPI_SCK, HSPI_MISO, HSPI_MOSI, SD_CS_PIN);
 
     if (!SD.begin(SD_CS_PIN, spiSD)) {
         Serial.println("[SD] AVISO - Cartao nao inicializou. Modo Bypass ativado.");
         g_sdAvailable = false;
-        /* O código não trava mais aqui. Ele segue a vida sem o SD. */
     } else {
         Serial.println("[SD] OK (HSPI)");
         g_sdAvailable = true;
@@ -1029,19 +1429,9 @@ void setup()
         }
     }
 
-    /* Mutex e fila */
-    g_dataMutex = xSemaphoreCreateMutex();
-    g_logQueue  = xQueueCreate(LOG_QUEUE_SIZE, sizeof(LogSample_t));
-    if (!g_dataMutex || !g_logQueue) {
-        Serial.println("[RTOS] ERRO ao criar mutex/queue");
-        while (1) { delay(1000); }
-    }
-
-    /* Tasks */
-    xTaskCreatePinnedToCore(task_can, "task_can", TASK_CAN_STACK, NULL, 2, NULL, 1);
-    xTaskCreatePinnedToCore(task_sd,  "task_sd",  TASK_SD_STACK,  NULL, 1, NULL, 0);
-
-    /* Animação de boot */
+    /* ================================== */
+    /* Animação de boot (SEMPRE PRIMEIRO) */
+    /* ================================== */
     for (int rep = 0; rep < 2; rep++) {
         for (int i = 0; i < RPM_LED_COUNT; i++) {
             g_rpmLeds[i] = CRGB::Blue;
@@ -1055,6 +1445,22 @@ void setup()
         }
     }
 
+    /* Mutex e fila */
+    g_dataMutex = xSemaphoreCreateMutex();
+    g_logQueue  = xQueueCreate(LOG_QUEUE_SIZE, sizeof(LogSample_t));
+    if (!g_dataMutex || !g_logQueue) {
+        Serial.println("[RTOS] ERRO ao criar mutex/queue");
+        while (1) { delay(1000); }
+    }
+
+    /* ================================== */
+    /* Cria as Tasks APENAS NO FINAL      */
+    /* ================================== */
+    xTaskCreatePinnedToCore(task_can, "task_can", TASK_CAN_STACK, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(task_sd,  "task_sd",  TASK_SD_STACK,  NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(task_hmi, "task_hmi", 4096, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(task_alerts, "task_alerts", 2048, NULL, 1, NULL, 1);
+
     Serial.println("[SYS] Pronto. Aguardando botao de lap...");
 }
 
@@ -1065,6 +1471,8 @@ void setup()
 void loop()
 {
     handleLapButton();
-    handlePageButton(); /* NOVO BOTAO AQUI */
-    delay(10);
+    handlePageButton();
+    handleMotionState();
+    
+    vTaskDelay(pdMS_TO_TICKS(10));
 }
